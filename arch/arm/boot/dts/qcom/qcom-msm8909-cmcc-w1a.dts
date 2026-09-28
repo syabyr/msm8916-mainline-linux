@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * CMCC W1A kids locator watch
+ *
+ * SoC: Qualcomm MSM8909 (APQ8009-class), PMIC PM8916
+ * Display: 400x400 round AMOLED (RM67162-class), DSI via MDP3
+ * Touch: FocalTech FT3267 @ blsp_i2c5 0x38 (mainline driver missing, node
+ *        kept for the bring-up driver port)
+ * Storage: eMMC (userdata = "sdcard" p33, firmware p1)
+ *
+ * Reference: downstream 3.18 DTB (stock-dtbs/01.dtb), acer-t01 mainline port.
+ */
+
+/dts-v1/;
+
+#include "qcom-msm8909-pm8909.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	model = "CMCC W1A";
+	compatible = "cmcc,w1a", "qcom,msm8909";
+	chassis-type = "watch";
+
+	aliases {
+		serial0 = &blsp_uart1;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		stdout-path = "serial0";
+
+		framebuffer@83000000 {
+			compatible = "simple-framebuffer";
+			reg = <0x83000000 (400 * 400 * 4)>;
+
+			width = <400>;
+			height = <400>;
+			stride = <(400 * 4)>;
+			format = "x8r8g8b8";
+
+			power-domains = <&gcc MDSS_GDSC>;
+
+			clocks = <&gcc GCC_MDSS_AHB_CLK>,
+				 <&gcc GCC_MDSS_AXI_CLK>,
+				 <&gcc GCC_MDSS_VSYNC_CLK>,
+				 <&gcc GCC_MDSS_MDP_CLK>,
+				 <&gcc GCC_MDSS_BYTE0_CLK>,
+				 <&gcc GCC_MDSS_PCLK0_CLK>,
+				 <&gcc GCC_MDSS_ESC0_CLK>;
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* downstream splash_region@83000000 (0xc00000) */
+		framebuffer@83000000 {
+			reg = <0x83000000 0x00c00000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * TODO: real battery characterization (downstream: 100k therm,
+	 * vref 1.8V, vddmax 4.36V). Values provisional until BMS logs
+	 * are captured under the mainline kernel.
+	 */
+	bat: battery {
+		compatible = "simple-battery";
+		voltage-min-design-microvolt = <3400000>;
+		voltage-max-design-microvolt = <4360000>;
+		charge-full-design-microamp-hours = <400000>;
+
+		ocv-capacity-celsius = <25>;
+		ocv-capacity-table-0 = <4335000 100>, <4265000 95>,
+			<4207000 90>, <4152000 85>, <4101000 80>, <4051000 75>,
+			<3995000 70>, <3958000 65>, <3921000 60>, <3874000 55>,
+			<3838000 50>, <3815000 45>, <3797000 40>, <3783000 35>,
+			<3772000 30>, <3763000 25>, <3744000 20>, <3718000 16>,
+			<3692000 13>, <3689000 11>, <3688000 10>, <3687000 9>,
+			<3685000 8>, <3683000 7>, <3679000 6>, <3663000 5>,
+			<3620000 4>, <3555000 3>, <3461000 2>, <3312000 1>,
+			<3000000 0>;
+	};
+};
+
+/* FocalTech FT3267 touch: downstream irq gpio13 active, reset gpio12,
+ * vdd/vcc_i2c = 8916_l6 (1.8V fixed), avdd = 8916_l17 (2.85V always-on).
+ * No mainline driver yet; node is inert until the port lands.
+ */
+&blsp_i2c5 {
+	status = "okay";
+
+	touchscreen@38 {
+		compatible = "focaltech,ft3267";
+		reg = <0x38>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <13 IRQ_TYPE_EDGE_FALLING>;
+
+		reset-gpios = <&tlmm 12 GPIO_ACTIVE_LOW>;
+
+		vdd-supply = <&pm8909_l6>;
+		vio-supply = <&pm8909_l6>;
+		avdd-supply = <&pm8909_l17>;
+
+		touchscreen-size-x = <400>;
+		touchscreen-size-y = <400>;
+
+		pinctrl-0 = <&touchscreen_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&blsp_uart1 {
+	status = "okay";
+};
+
+&pm8909_bms {
+	monitored-battery = <&bat>;
+	power-supplies = <&pm8909_charger>;
+	status = "okay";
+};
+
+&pm8909_charger {
+	qcom,fast-charge-safe-current = <630000>;
+	qcom,fast-charge-safe-voltage = <4300000>;
+
+	monitored-battery = <&bat>;
+
+	status = "okay";
+};
+
+&pm8909_vib {
+	status = "okay";
+};
+
+&sdhc_1 {
+	status = "okay";
+};
+
+&usb {
+	extcon = <&pm8909_charger>;
+	status = "okay";
+};
+
+&usb_hs_phy {
+	extcon = <&pm8909_charger>;
+};
+
+&wcnss {
+	status = "okay";
+};
+
+&wcnss_iris {
+	compatible = "qcom,wcn3620";
+};
+
+&smd_rpm_regulators {
+	/* downstream: l6/l17 always-on (touch + wcnss iris rails) */
+	l6 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+
+	l17 {
+		regulator-min-microvolt = <2850000>;
+		regulator-max-microvolt = <2850000>;
+	};
+};
+
+&tlmm {
+	touchscreen_default: touchscreen-default-state {
+		reset-pins {
+			pins = "gpio12";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		touchscreen-pins {
+			pins = "gpio13";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+	};
+};
