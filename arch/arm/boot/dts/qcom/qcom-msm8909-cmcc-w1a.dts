@@ -156,15 +156,106 @@
 };
 
 &smd_rpm_regulators {
-	/* downstream: l6/l17 always-on (touch + wcnss iris rails) */
-	l6 {
+	/*
+	 * Voltage ranges from the downstream 3.18 DTB (stock-dtbs/01.dtb,
+	 * rpm-regulator-ldoa*). The dtsi leaves every rpm regulator as an
+	 * empty node {}: without board-level min/max the regulator core
+	 * rejects every voltage change ("voltage operation not allowed"),
+	 * which killed eMMC (vmmc = l8) and the USB HS phy (l7/l13) on
+	 * the first mainline boots.
+	 */
+	s2 {
+		/* unused on W1A (downstream: disabled) */
+		regulator-min-microvolt = <1850000>;
+		regulator-max-microvolt = <1850000>;
+	};
+
+	l1 {
+		regulator-min-microvolt = <1000000>;
+		regulator-max-microvolt = <1000000>;
+	};
+
+	l2 {
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+	};
+
+	l4 {
 		regulator-min-microvolt = <1800000>;
 		regulator-max-microvolt = <1800000>;
 	};
 
+	/* vqmmc for eMMC (HS200 1.8V signaling) */
+	l5 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+
+	/* touch + wcnss iris rails: always-on downstream */
+	l6 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	/* USB HS phy v1p8 */
+	l7 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+
+	/* vmmc for eMMC */
+	l8 {
+		regulator-min-microvolt = <2850000>;
+		regulator-max-microvolt = <2900000>;
+	};
+
+	l9 {
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+	};
+
+	l10 {
+		regulator-min-microvolt = <2700000>;
+		regulator-max-microvolt = <2800000>;
+	};
+
+	l11 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <2950000>;
+	};
+
+	l12 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <2950000>;
+	};
+
+	/* USB HS phy v3p3 */
+	l13 {
+		regulator-min-microvolt = <3075000>;
+		regulator-max-microvolt = <3075000>;
+	};
+
+	l14 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <3300000>;
+	};
+
+	l15 {
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <3300000>;
+	};
+
+	/* wcnss iris avdd, always-on downstream */
 	l17 {
 		regulator-min-microvolt = <2850000>;
 		regulator-max-microvolt = <2850000>;
+		regulator-always-on;
+	};
+
+	l18 {
+		regulator-min-microvolt = <2700000>;
+		regulator-max-microvolt = <2700000>;
 	};
 };
 
