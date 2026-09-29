@@ -177,9 +177,19 @@
 		regulator-max-microvolt = <1000000>;
 	};
 
+	/* DSI PHY vdda (1.2V): downstream mdss_dsi vdda-supply = 8916_l2.
+	 * Mainline has no DSI node, so nothing holds a reference and the
+	 * regulator late cleanup disables it ~1.9s into boot - the DSI link
+	 * dies and the panel freezes on its last GRAM image (lk2nd UI). This
+	 * is what broke the screen starting at boot #9: before the l8 fix the
+	 * rpm regulator requests all failed, so l2 simply kept whatever state
+	 * lk2nd had left (on). Keep it on until a real MDP3/DSI driver owns
+	 * this rail. Same rationale as l6/l17.
+	 */
 	l2 {
 		regulator-min-microvolt = <1200000>;
 		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
 	};
 
 	l4 {
@@ -264,6 +274,14 @@
 		regulator-min-microvolt = <2700000>;
 		regulator-max-microvolt = <2700000>;
 	};
+};
+
+&gpu {
+	status = "okay";
+};
+
+&gpu_iommu {
+	status = "okay";
 };
 
 &gcc {

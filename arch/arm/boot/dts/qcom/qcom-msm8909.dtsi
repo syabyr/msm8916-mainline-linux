@@ -819,6 +819,96 @@
 			clock-names = "xo", "sleep_clk", "dsi0pll", "dsi0pllbyte";
 		};
 
+		/*
+		 * GPU SMMU (QSMMU v1) dedicated to the Adreno GPU. The global
+		 * register block lives at 0x1f08000, NOT at 0x1f00000: the
+		 * downstream 3.18 DTB exposes gfx_iommu with gfx3d_user
+		 * (ctx@1f09000) and gfx3d_priv (ctx@1f0a000) context banks.
+		 * Reading the area below 0x1f08000 (e.g. an arm-smmu style
+		 * IDR0 at 0x1f00020) stalls the bus forever - boot hang with
+		 * no panic, seen 2026-09-29 with a "qcom,smmu-v2" node. The
+		 * hardware is an msm8916-class QSMMU v1; wire it up the same
+		 * way upstream msm8916.dtsi does (qcom_iommu driver).
+		 *
+		 * The global config is owned by TrustZone: the driver programs
+		 * it through qcom_scm_restore_sec_cfg() using the secure id
+		 * (18 = 0x12, same value as the downstream DTB), it never
+		 * touches the global registers directly.
+		 */
+		gpu_iommu: iommu@1f08000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			#iommu-cells = <1>;
+			compatible = "qcom,msm8909-iommu", "qcom,msm-iommu-v1";
+			ranges = <0 0x01f08000 0x10000>;
+			clocks = <&gcc GCC_SMMU_CFG_CLK>,
+				 <&gcc GCC_GFX_TCU_CLK>;
+			clock-names = "iface", "bus";
+			qcom,iommu-secure-id = <18>;
+
+			/* GFX3D_USER (downstream ctx@1f09000) */
+			iommu-ctx@1000 {
+				compatible = "qcom,msm-iommu-v1-ns";
+				reg = <0x1000 0x1000>;
+				interrupts = <GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH>;
+			};
+
+			/* GFX3D_PRIV (downstream ctx@1f0a000) */
+			iommu-ctx@2000 {
+				compatible = "qcom,msm-iommu-v1-ns";
+				reg = <0x2000 0x1000>;
+				interrupts = <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>;
+			};
+		};
+
+		/*
+		 * Adreno 304. Register map, interrupt, gmem (96K), firmware
+		 * (a300) and power levels (200MHz max per stock DTB
+		 * qcom,gpu-pwrlevels) taken from the downstream skipjack
+		 * qcom,kgsl-3d0@01c00000 node.
+		 */
+		gpu: gpu@1c00000 {
+			compatible = "qcom,adreno-304.0", "qcom,adreno";
+			reg = <0x01c00000 0x20000>;
+			reg-names = "kgsl_3d0_reg_memory";
+			interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "kgsl_3d0_irq";
+			/*
+			 * Clock set mirrors the downstream 3.18 kgsl-3d0 node
+			 * (clock-names: core_clk, iface_clk, mem_iface_clk,
+			 * alt_mem_iface_clk, gtcu_iface_clk): without the BIMC
+			 * memory-path clocks and the graphics TCU AHB clock the
+			 * first GPU status read in a3xx_hw_init stalls the bus
+			 * (silent hang + watchdog reset, 2026-09-29). 8909 has
+			 * no oxili_gmem branch, unlike 8916. The driver uses
+			 * clk_bulk_get_all(), so every clock listed here is
+			 * enabled at runtime resume.
+			 */
+			clocks = <&gcc GCC_OXILI_GFX3D_CLK>,
+				 <&gcc GCC_OXILI_AHB_CLK>,
+				 <&gcc GCC_BIMC_GFX_CLK>,
+				 <&gcc GCC_BIMC_GPU_CLK>,
+				 <&gcc GCC_GFX_TCU_CLK>;
+			clock-names = "core", "iface", "mem_iface",
+				      "alt_mem_iface", "gtcu_iface";
+			power-domains = <&gcc OXILI_GDSC>;
+			operating-points-v2 = <&gpu_opp_table>;
+			iommus = <&gpu_iommu 1>, <&gpu_iommu 2>;
+			status = "disabled";
+
+			gpu_opp_table: opp-table {
+				compatible = "operating-points-v2";
+
+				opp-19200000 {
+					opp-hz = /bits/ 64 <19200000>;
+				};
+
+				opp-200000000 {
+					opp-hz = /bits/ 64 <200000000>;
+				};
+			};
+		};
+
 		tcsr_mutex: hwlock@1905000 {
 			compatible = "qcom,tcsr-mutex";
 			reg = <0x01905000 0x20000>;
