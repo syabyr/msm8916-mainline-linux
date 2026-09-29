@@ -330,6 +330,11 @@ static inline bool adreno_is_a305(const struct adreno_gpu *gpu)
 	return adreno_is_revn(gpu, 305);
 }
 
+static inline bool adreno_is_a304(const struct adreno_gpu *gpu)
+{
+	return adreno_is_revn(gpu, 304);
+}
+
 static inline bool adreno_is_a305b(const struct adreno_gpu *gpu)
 {
 	return gpu->info->chip_ids[0] == 0x03000512;

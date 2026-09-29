@@ -11,6 +11,21 @@
 
 static const struct adreno_info a3xx_gpus[] = {
 	{
+		/* Adreno 304 (MSM8909): same a300 firmware as A305, but
+		 * smaller GMEM (96K) and simpler VBIF init (downstream
+		 * a304_vbif programs ROUND_ROBIN_QOS_ARB only).
+		 */
+		.chip_ids = ADRENO_CHIP_IDS(0x03000400),
+		.family = ADRENO_3XX,
+		.revn  = 304,
+		.fw = {
+			[ADRENO_FW_PM4] = "a300_pm4.fw",
+			[ADRENO_FW_PFP] = "a300_pfp.fw",
+		},
+		.gmem  = SZ_64K + SZ_32K,
+		.inactive_period = DRM_MSM_INACTIVE_PERIOD,
+		.funcs = &a3xx_gpu_funcs,
+	}, {
 		.chip_ids = ADRENO_CHIP_IDS(0x03000512),
 		.family = ADRENO_3XX,
 		.fw = {
