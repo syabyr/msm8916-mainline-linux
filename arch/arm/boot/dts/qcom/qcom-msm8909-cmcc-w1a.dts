@@ -266,6 +266,28 @@
 	};
 };
 
+&gcc {
+	/*
+	 * lk2nd brings the panel up (MDP3 + DSI + RM67162, command mode)
+	 * before jumping to the kernel and injects the simplefb node. The
+	 * mainline kernel has no MDP3 driver, so nothing claims these clocks
+	 * and the clk framework gates them off at late_initcall ("Disabling
+	 * unused clocks") - the scanout dies and the panel freezes on the
+	 * last lk2nd frame; writes to /dev/fb0 go nowhere. 'protected-clocks'
+	 * keeps them unregistered so the framework never touches the state
+	 * lk2nd programmed. Remove this when a real MDP3 DRM driver lands
+	 * (it will want to control these clocks itself).
+	 */
+	protected-clocks = <GCC_MDP_TBU_CLK>,
+			    <GCC_MDSS_AHB_CLK>,
+			    <GCC_MDSS_AXI_CLK>,
+			    <GCC_MDSS_BYTE0_CLK>,
+			    <GCC_MDSS_ESC0_CLK>,
+			    <GCC_MDSS_MDP_CLK>,
+			    <GCC_MDSS_PCLK0_CLK>,
+			    <GCC_MDSS_VSYNC_CLK>;
+};
+
 &tlmm {
 	/*
 	 * eMMC CMD line: stock DTB drives sdc1_cmd with bias-pull-up; the
@@ -283,14 +305,14 @@
 		reset-pins {
 			pins = "gpio12";
 			function = "gpio";
-			drive-strength = <2>;
+			drive-strength = <8>;
 			bias-disable;
 		};
 
 		touchscreen-pins {
 			pins = "gpio13";
 			function = "gpio";
-			drive-strength = <2>;
+			drive-strength = <8>;
 			bias-pull-up;
 		};
 	};
