@@ -204,6 +204,7 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 	const struct msm_dsi_cfg_handler *cfg_hnd = NULL;
 	struct device *dev = &msm_host->pdev->dev;
 	struct clk *ahb_clk;
+	bool ahb_was_enabled;
 	int ret;
 	u32 major = 0, minor = 0;
 
@@ -213,6 +214,16 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 			      __func__);
 		goto exit;
 	}
+
+	/*
+	 * Transitional for lk2nd-booted boards: the bootloader leaves the
+	 * MDSS AHB clock on with no owning driver yet. The clk framework's
+	 * enable counter is not synced to hardware state at registration,
+	 * so an unconditional clk_disable_unprepare() here would gate the
+	 * branch and kill the live MDP3/DSI state (any register access
+	 * then stalls the bus). Only drop the clock if we enabled it.
+	 */
+	ahb_was_enabled = __clk_is_enabled(ahb_clk);
 
 	pm_runtime_get_sync(dev);
 
@@ -232,8 +243,14 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 
 	DBG("%s: Version %x:%x\n", __func__, major, minor);
 
+	if (!cfg_hnd)
+		dev_err_probe(dev, -ENODEV,
+			      "%s: no cfg for DSI version %x:%x\n",
+			      __func__, major, minor);
+
 disable_clks:
-	clk_disable_unprepare(ahb_clk);
+	if (!ahb_was_enabled)
+		clk_disable_unprepare(ahb_clk);
 runtime_put:
 	pm_runtime_put_sync(dev);
 exit:

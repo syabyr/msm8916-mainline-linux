@@ -63,7 +63,8 @@ static const struct msm_dsi_config msm8916_dsi_cfg = {
 	.bus_clk_names = dsi_v1_3_1_clk_names,
 	.num_bus_clks = ARRAY_SIZE(dsi_v1_3_1_clk_names),
 	.io_start = {
-		{ 0x1a98000 },
+		{ 0x1a98000 },		/* MSM8916 */
+		{ 0x1ac8000 },		/* MSM8909 */
 	},
 };
 
