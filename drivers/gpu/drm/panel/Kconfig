@@ -641,6 +641,16 @@ config DRM_PANEL_RAYDIUM_RM67191
 	  Say Y here if you want to enable support for Raydium RM67191 FHD
 	  (1080x1920) DSI panel.
 
+config DRM_PANEL_RAYDIUM_RM67162
+	tristate "Raydium RM67162 WQVGA 400x400 round DSI command mode panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here if you want to enable support for Raydium RM67162 WQVGA
+	  (400x400 round) DSI command mode panel, as found on smart watches
+	  like the CMCC W1A.
+
 config DRM_PANEL_RAYDIUM_RM67200
 	tristate "Raydium RM67200-based DSI panel"
 	depends on OF
