@@ -34,25 +34,11 @@
 
 		stdout-path = "serial0";
 
-		framebuffer@83000000 {
-			compatible = "simple-framebuffer";
-			reg = <0x83000000 (400 * 400 * 4)>;
-
-			width = <400>;
-			height = <400>;
-			stride = <(400 * 4)>;
-			format = "x8r8g8b8";
-
-			power-domains = <&gcc MDSS_GDSC>;
-
-			clocks = <&gcc GCC_MDSS_AHB_CLK>,
-				 <&gcc GCC_MDSS_AXI_CLK>,
-				 <&gcc GCC_MDSS_VSYNC_CLK>,
-				 <&gcc GCC_MDSS_MDP_CLK>,
-				 <&gcc GCC_MDSS_BYTE0_CLK>,
-				 <&gcc GCC_MDSS_PCLK0_CLK>,
-				 <&gcc GCC_MDSS_ESC0_CLK>;
-		};
+		/*
+		 * No hand-written framebuffer node: lk2nd injects the real
+		 * one (actual MDP3 format/stride/clocks) when booted with
+		 * lk2nd.pass-simplefb=xrgb8888 on the cmdline.
+		 */
 	};
 
 	reserved-memory {
