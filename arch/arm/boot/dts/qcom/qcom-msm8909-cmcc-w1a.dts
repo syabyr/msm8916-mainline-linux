@@ -125,6 +125,8 @@
 };
 
 &sdhc_1 {
+	/* CMD with internal pull-up (see tlmm/sdc1_cmd_w1a) */
+	pinctrl-0 = <&sdc1_clk_on &sdc1_cmd_w1a &sdc1_data_on>;
 	status = "okay";
 };
 
@@ -215,10 +217,14 @@
 		regulator-max-microvolt = <3300000>;
 	};
 
-	/* wcnss iris vddrfa (downstream range; driver requests 2.75V) */
+	/* wcnss iris vddrfa: mainline iris driver requests fixed 1.3V
+	 * (qcom_wcnss_iris.c vddrfa 1300000-1300000). Downstream 3.18 ran
+	 * l10 at 2.7-2.8V for its own driver - that range makes the
+	 * mainline request fail with "unsupportable voltage range".
+	 */
 	l10 {
-		regulator-min-microvolt = <2700000>;
-		regulator-max-microvolt = <2800000>;
+		regulator-min-microvolt = <1225000>;
+		regulator-max-microvolt = <1300000>;
 	};
 
 	l11 {
@@ -261,6 +267,18 @@
 };
 
 &tlmm {
+	/*
+	 * eMMC CMD line: stock DTB drives sdc1_cmd with bias-pull-up; the
+	 * dtsi default (bias-disable) leaves CMD floating - W1A has no
+	 * external pull on the eMMC bus and mmc0 fails card init with no
+	 * response ("Failed to initialize a non-removable card").
+	 */
+	sdc1_cmd_w1a: sdc1-cmd-w1a-state {
+		pins = "sdc1_cmd";
+		bias-pull-up;
+		drive-strength = <10>;
+	};
+
 	touchscreen_default: touchscreen-default-state {
 		reset-pins {
 			pins = "gpio12";
