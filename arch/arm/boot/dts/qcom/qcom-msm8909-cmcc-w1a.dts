@@ -17,6 +17,7 @@
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/qcom,dsi-phy-28nm.h>
 
 / {
 	model = "CMCC W1A";
@@ -157,6 +158,108 @@
 	compatible = "qcom,wcn3620";
 };
 
+/*
+ * Display bring-up (B-full step 1: DSI host + PHY + panel).
+ *
+ * MDP3 (display-controller@1a00000) has no mainline driver yet; it stays
+ * driven by the lk2nd-programmed state (12 fps autorefresh) until the
+ * MDP3 KMS driver lands. These nodes wire the DSI controller (ctrl
+ * @0x1ac8000, GIC 80), its 28nm-lp PHY (pll @0x1ac8300, phy @0x1ac8500,
+ * regulator @0x1ac8780 - same register layout as msm8916, different
+ * addresses) and the RM67162 panel so their drivers can probe.
+ *
+ * Register data from the downstream 3.18 DTB (stock-dtbs/01.dtb):
+ * mdss_dsi_ctrl0@1ac8000, qcom,mdss_dsi_pll@1ac8300, rm67162_wqvga_cmd.
+ */
+&soc {
+	dsi@1ac8000 {
+		compatible = "qcom,mdss-dsi-ctrl";
+		reg = <0x01ac8000 0x25c>;
+		reg-names = "dsi_ctrl";
+		interrupts = <GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH>;
+
+		assigned-clocks = <&gcc BYTE0_CLK_SRC>,
+				  <&gcc PCLK0_CLK_SRC>;
+		assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+					 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
+
+		clocks = <&gcc GCC_MDSS_MDP_CLK>,
+			 <&gcc GCC_MDSS_AHB_CLK>,
+			 <&gcc GCC_MDSS_AXI_CLK>,
+			 <&gcc GCC_MDSS_BYTE0_CLK>,
+			 <&gcc GCC_MDSS_PCLK0_CLK>,
+			 <&gcc GCC_MDSS_ESC0_CLK>;
+		clock-names = "mdp_core",
+			      "iface",
+			      "bus",
+			      "byte",
+			      "pixel",
+			      "core";
+
+		vdda-supply = <&pm8909_l2>;
+		vddio-supply = <&pm8909_l6>;
+
+		phys = <&mdss_dsi0_phy>;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pinctrl-0 = <&mdss_dsi_active>;
+		pinctrl-names = "default";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+
+				mdss_dsi0_out: endpoint {
+					remote-endpoint = <&panel_in>;
+					/* single data lane, no lane swap (lane_map_0123) */
+					data-lanes = <0>;
+				};
+			};
+		};
+
+		panel@0 {
+			compatible = "raydium,rm67162";
+			reg = <0>;
+
+			reset-gpios = <&tlmm 25 GPIO_ACTIVE_HIGH>;
+			backlight-enable-gpios = <&tlmm 37 GPIO_ACTIVE_HIGH>;
+
+			vdd-supply = <&pm8909_l17>;
+			vddio-supply = <&pm8909_l6>;
+
+			port {
+				panel_in: endpoint {
+					remote-endpoint = <&mdss_dsi0_out>;
+				};
+			};
+		};
+	};
+
+	mdss_dsi0_phy: phy@1ac8300 {
+		compatible = "qcom,dsi-phy-28nm-8909";
+		reg = <0x01ac8300 0xd4>,
+		      <0x01ac8500 0x280>,
+		      <0x01ac8780 0x30>;
+		reg-names = "dsi_pll",
+			    "dsi_phy",
+			    "dsi_phy_regulator";
+
+		#clock-cells = <1>;
+		#phy-cells = <0>;
+
+		clocks = <&gcc GCC_MDSS_AHB_CLK>,
+			 <&xo_board>;
+		clock-names = "iface", "ref";
+
+		vddio-supply = <&pm8909_l6>;
+	};
+};
+
 &smd_rpm_regulators {
 	/*
 	 * Voltage ranges from the downstream 3.18 DTB (stock-dtbs/01.dtb,
@@ -287,23 +390,29 @@
 &gcc {
 	/*
 	 * lk2nd brings the panel up (MDP3 + DSI + RM67162, command mode)
-	 * before jumping to the kernel and injects the simplefb node. The
-	 * mainline kernel has no MDP3 driver, so nothing claims these clocks
-	 * and the clk framework gates them off at late_initcall ("Disabling
-	 * unused clocks") - the scanout dies and the panel freezes on the
-	 * last lk2nd frame; writes to /dev/fb0 go nowhere. 'protected-clocks'
-	 * keeps them unregistered so the framework never touches the state
-	 * lk2nd programmed. Remove this when a real MDP3 DRM driver lands
-	 * (it will want to control these clocks itself).
+	 * before jumping to the kernel and injects the simplefb node.
+	 *
+	 * The DSI PLL clocks from the PHY feed gcc's dsi0pll/dsi0pllbyte
+	 * inputs (the dtsi leaves them as <0> placeholders), so that
+	 * byte0/pclk0 clk_src can be reparented to the PHY PLLs.
 	 */
-	protected-clocks = <GCC_MDP_TBU_CLK>,
-			    <GCC_MDSS_AHB_CLK>,
-			    <GCC_MDSS_AXI_CLK>,
-			    <GCC_MDSS_BYTE0_CLK>,
-			    <GCC_MDSS_ESC0_CLK>,
-			    <GCC_MDSS_MDP_CLK>,
-			    <GCC_MDSS_PCLK0_CLK>,
-			    <GCC_MDSS_VSYNC_CLK>;
+	clocks = <&xo_board>, <&sleep_clk>,
+		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>;
+	clock-names = "xo", "sleep_clk", "dsi0pll", "dsi0pllbyte";
+
+	/*
+	 * MDSS clocks were previously all protected (unregistered) so the
+	 * clk framework could not gate off what lk2nd programmed while
+	 * nothing claimed them. The DSI/PHY drivers now need them
+	 * registered, so only GCC_MDP_TBU_CLK (MDP SMMU translation
+	 * buffer, claimed by the future MDP3 driver) stays protected.
+	 *
+	 * Boot with clk_ignore_unused until the MDP3 DRM driver owns the
+	 * whole display path, or the late_initcall clock sweep gates the
+	 * lk2nd state and the panel freezes mid-boot.
+	 */
+	protected-clocks = <GCC_MDP_TBU_CLK>;
 };
 
 &tlmm {
@@ -333,5 +442,26 @@
 			drive-strength = <8>;
 			bias-pull-up;
 		};
+	};
+
+	/* DSI panel reset (gpio25) + backlight enable (gpio37):
+	 * stock mdss_dsi_active drives both high at 8mA.
+	 */
+	mdss_dsi_active: mdss-dsi-active-state {
+		pins = "gpio25", "gpio37";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	/* Panel TE -> MDP3 vsync: routed to the mdp_vsync function
+	 * (stock pmx_mdss_te), used by the MDP3 tear-check once that
+	 * driver lands.
+	 */
+	mdss_te_active: mdss-te-active-state {
+		pins = "gpio24";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
 	};
 };
