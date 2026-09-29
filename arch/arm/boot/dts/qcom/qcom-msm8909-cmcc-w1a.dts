@@ -146,13 +146,26 @@
 	status = "okay";
 };
 
+/*
+ * USB: peripheral-only like all working msm8909 devices (zte-sapphire,
+ * lenovo-lxf-p5x00). extcon = pm8909_usbin (independent usb_vbus IRQ
+ * extcon, qcom,pm8941-misc), not the charger — with dr_mode="otg" and
+ * an extcon that never fires, ci-hdrc stays IDLE and the UDC never
+ * binds (the silent-USB failure mode seen on the first two boots).
+ */
+&pm8909_usbin {
+	status = "okay";
+};
+
 &usb {
-	extcon = <&pm8909_charger>;
+	extcon = <&pm8909_usbin>;
+	dr_mode = "peripheral";
 	status = "okay";
 };
 
 &usb_hs_phy {
-	extcon = <&pm8909_charger>;
+	extcon = <&pm8909_usbin>;
+	status = "okay";
 };
 
 &wcnss {
