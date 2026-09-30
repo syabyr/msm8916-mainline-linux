@@ -16,12 +16,16 @@
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/printk.h>
 #include <linux/regulator/consumer.h>
+extern void w1a_mb(const char *fmt, ...); /* W1A mailbox */
 
 #include <video/mipi_display.h>
 
 #include <drm/drm_mipi_dsi.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 
 /* Write Manufacture Command Set Control (page switch) */
@@ -110,6 +114,9 @@ static int rm67162_panel_prepare(struct drm_panel *panel)
 	struct rm67162_panel *ctx = to_rm67162_panel(panel);
 	int ret;
 
+	dev_info(&ctx->dsi->dev, "MDP3DBG panel prepare\n");
+	w1a_mb("panel prepare (reset+init cmds next)");
+
 	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
 	if (ret)
 		return ret;
@@ -125,6 +132,8 @@ static int rm67162_panel_prepare(struct drm_panel *panel)
 	msleep(20);
 
 	ctx->prepared = true;
+
+	dev_info(&ctx->dsi->dev, "MDP3DBG panel prepared\n");
 
 	return 0;
 }
@@ -153,11 +162,17 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
+	dev_info(dev, "MDP3DBG panel enable: sending init seq\n");
+	w1a_mb("panel enable: init seq next");
+
 	ret = rm67162_push_cmd_list(dsi);
 	if (ret < 0) {
 		dev_err(dev, "Failed to send vendor commands (%d)\n", ret);
 		return ret;
 	}
+
+	dev_info(dev, "MDP3DBG panel enable: init seq done, tear on\n");
+	w1a_mb("panel enable: init seq done");
 
 	/* tear on, sourced from the TE pin (DCS 0x35 0x00) */
 	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
@@ -179,6 +194,9 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 		dev_err(dev, "Failed to set display ON (%d)\n", ret);
 		return ret;
 	}
+
+	dev_info(dev, "MDP3DBG panel enabled\n");
+	w1a_mb("panel enabled");
 
 	return 0;
 }
@@ -289,6 +307,11 @@ static int rm67162_panel_probe(struct mipi_dsi_device *dsi)
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	/* command mode panel: no MIPI_DSI_MODE_VIDEO */
 	dsi->mode_flags = 0;
+
+	/* DSI host (the previous bridge) must be powered on before the
+	 * panel is prepared/reset - the panel bridge uses this flag to
+	 * reorder pre_enable across the chain */
+	ctx->panel.prepare_prev_first = true;
 
 	ctx->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ctx->reset))

@@ -26,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/printk.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -61,6 +62,7 @@ struct qcom_iommu_ctx {
 	bool			 secured_ctx;
 	u8			 asid;      /* asid and ctx bank # are 1:1 */
 	struct iommu_domain	*domain;
+	bool			 sync_logged; /* W1A bring-up marker */
 };
 
 struct qcom_iommu_domain {
@@ -121,12 +123,24 @@ static void qcom_iommu_tlb_sync(void *cookie)
 		struct qcom_iommu_ctx *ctx = to_ctx(qcom_domain, fwspec->ids[i]);
 		unsigned int val, ret;
 
+		/* W1A bring-up: this readl_poll_timeout is the prime
+		 * bus-hang suspect when the SMMU clocks are gated. */
+		if (ctx->dev && !ctx->sync_logged) {
+			pr_info("MDP3DBG tlb_sync: polling TLBSTATUS ctx=%p asid=%u\n",
+				ctx->base, ctx->asid);
+		}
+
 		iommu_writel(ctx, ARM_SMMU_CB_TLBSYNC, 0);
 
 		ret = readl_poll_timeout(ctx->base + ARM_SMMU_CB_TLBSTATUS, val,
 					 (val & 0x1) == 0, 0, 5000000);
 		if (ret)
 			dev_err(ctx->dev, "timeout waiting for TLB SYNC\n");
+
+		if (ctx->dev && !ctx->sync_logged) {
+			pr_info("MDP3DBG tlb_sync: done val=%08x\n", val);
+			ctx->sync_logged = true;
+		}
 	}
 }
 
@@ -434,13 +448,33 @@ static int qcom_iommu_map(struct iommu_domain *domain, unsigned long iova,
 	unsigned long flags;
 	struct qcom_iommu_domain *qcom_domain = to_qcom_iommu_domain(domain);
 	struct io_pgtable_ops *ops = qcom_domain->pgtbl_ops;
+	static atomic_t map_count = ATOMIC_INIT(0);
+	int nmaps;
 
 	if (!ops)
 		return -ENODEV;
 
+	/* W1A bring-up: qcom_iommu_map (unlike unmap) is NOT bracketed by
+	 * runtime PM.  If the io-pgtable code ever touches the TLB on the
+	 * map path while the SMMU clocks are gated, the TLBSTATUS poll
+	 * hangs the bus.  Bracket the first map to be safe and pin the
+	 * first few maps in the log while at it. */
+	nmaps = atomic_inc_return(&map_count);
+	if (nmaps <= 3) {
+		pr_info("MDP3DBG iommu_map #%d: iova=%lx pa=%pa size=%zx\n",
+			nmaps, iova, &paddr, pgsize * pgcount);
+	}
+	if (nmaps == 1)
+		pm_runtime_get_sync(qcom_domain->iommu->dev);
 	spin_lock_irqsave(&qcom_domain->pgtbl_lock, flags);
 	ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, GFP_ATOMIC, mapped);
 	spin_unlock_irqrestore(&qcom_domain->pgtbl_lock, flags);
+	if (nmaps == 1)
+		pm_runtime_put_sync(qcom_domain->iommu->dev);
+	if (nmaps <= 3) {
+		pr_info("MDP3DBG iommu_map #%d: done ret=%d mapped=%zx\n",
+			nmaps, ret, *mapped);
+	}
 	return ret;
 }
 
