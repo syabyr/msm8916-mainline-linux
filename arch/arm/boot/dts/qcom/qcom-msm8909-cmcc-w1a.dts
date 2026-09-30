@@ -13,6 +13,12 @@
 
 /dts-v1/;
 
+/* W1A m2s: lk2nd's last DSI command DMA buffer lives here (its splash
+ * path is deterministic across boots).  Keep the page out of Linux's
+ * allocator so the fetch probe can copy a packet to the exact address
+ * lk2nd successfully fetched from. */
+/memreserve/ 0x08f68f000 0x1000;
+
 #include "qcom-msm8909-pm8909.dtsi"
 
 #include <dt-bindings/gpio/gpio.h>
@@ -171,7 +177,96 @@
  * Register data from the downstream 3.18 DTB (stock-dtbs/01.dtb):
  * mdss_dsi_ctrl0@1ac8000, qcom,mdss_dsi_pll@1ac8300, rm67162_wqvga_cmd.
  */
+
+/*
+ * Apps SMMU (B-full step 2: MDP3 KMS).  Like the GPU SMMU this is an
+ * msm8916-class QSMMU v1, not smmu-v2: the downstream 3.18 DTB
+ * declares apps_iommu with reg <0x1e00000 0x40000> + smmu_local_base
+ * 0x1ef0000, and the context banks sit at 0x1e20000+ with the same
+ * layout as 8916 (vfe@1e23000, mdp_0@1e24000, venus_ns@1e25000).
+ * Wire it like upstream msm8916.dtsi: global regs at 0x1ef0000, ctx
+ * range at 0x1e20000, secure id 17.  Only the MDP_0 context (non-
+ * secure, SID 0xc00 -> asid 4) is described; msm GEM scanout needs
+ * exactly that one.
+ */
 &soc {
+	apps_iommu: iommu@1ef0000 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		#iommu-cells = <1>;
+		compatible = "qcom,msm8909-iommu", "qcom,msm-iommu-v1";
+		ranges = <0 0x01e20000 0x20000>;
+		reg = <0x01ef0000 0x3000>;
+		/*
+		 * m2u: "tbu" is qcom_iommu's optional third clock, bulk-enabled
+		 * whenever the SMMU is resumed (attach).  The MDP TBU is the
+		 * translation buffer unit every MDSS-port AXI read must cross
+		 * once qcom_scm_restore_sec_cfg switches the port from bypass
+		 * to CB4 translation - nothing else under mainline ever votes
+		 * it (APCS 0x4500c BIT(4)); downstream's SMMU-v2 driver votes
+		 * it, lk2nd never did (bypass mode).  A fetch hitting a
+		 * clock-gated TBU hangs with no fault latched - matches the
+		 * m2n-m2t evidence exactly (both engines, FSR clean).
+		 */
+		clocks = <&gcc GCC_SMMU_CFG_CLK>,
+			 <&gcc GCC_APSS_TCU_CLK>,
+			 <&gcc GCC_MDP_TBU_CLK>;
+		clock-names = "iface", "bus", "tbu";
+		qcom,iommu-secure-id = <17>;
+
+		/* MDP_0 (downstream ctx@1e24000, SID 0xc00 -> asid 4) */
+		iommu-ctx@4000 {
+			compatible = "qcom,msm-iommu-v1-ns";
+			reg = <0x4000 0x1000>;
+			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
+		};
+	};
+
+	/*
+	 * MDP3 display pipeline (B-full step 2): the single DMA_P fetch
+	 * pipe feeding DSI command mode.  reg/irq/clock names follow the
+	 * downstream mdss dtsi node (mdp_phys 0x1a00000+0x100000 incl.
+	 * the DMA_P block @0x90000, vbif 0x1ab0000, GIC 72, iface/bus/
+	 * core_src/core/vsync + gdsc_mdss).  Port 0 is the DSI input the
+	 * msm drm component graph walks.
+	 */
+	mdp3: display-controller@1a00000 {
+		compatible = "qcom,mdp3";
+		reg = <0x01a00000 0x100000>,
+		      <0x01ab0000 0x3000>;
+		reg-names = "core", "vbif";
+		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
+
+		clocks = <&gcc GCC_MDSS_MDP_CLK>,
+			 <&gcc GCC_MDSS_AHB_CLK>,
+			 <&gcc GCC_MDSS_AXI_CLK>,
+			 <&gcc GCC_MDSS_VSYNC_CLK>;
+		clock-names = "core_clk", "iface_clk", "bus_clk", "vsync_clk";
+
+		power-domains = <&gcc MDSS_GDSC>;
+
+		iommus = <&apps_iommu 4>;
+
+		/* m3g: mux the panel TE pin (gpio24) to the MDP3 tear-check
+		 * block's vsync input - SYNC_PRIMARY_LINE is the continuous
+		 * vblank source for command mode */
+		pinctrl-0 = <&mdss_te_active>;
+		pinctrl-names = "default";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				mdp3_out: endpoint {
+					remote-endpoint = <&mdss_dsi0_in>;
+				};
+			};
+		};
+	};
+
 	dsi@1ac8000 {
 		compatible = "qcom,mdss-dsi-ctrl";
 		reg = <0x01ac8000 0x25c>;
@@ -210,6 +305,15 @@
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
+
+			/* MDP3 -> DSI (command mode input) */
+			port@0 {
+				reg = <0>;
+
+				mdss_dsi0_in: endpoint {
+					remote-endpoint = <&mdp3_out>;
+				};
+			};
 
 			port@1 {
 				reg = <1>;
@@ -257,6 +361,20 @@
 		clock-names = "iface", "ref";
 
 		vddio-supply = <&pm8909_l6>;
+
+		/*
+		 * DPHY timing from the vendor panel file
+		 * (lk2nd lk_panel_rm67162_wqvga_cmd.h): raw
+		 * TIMING_CTRL_0..11 register values plus T_CLK_PRE /
+		 * T_CLK_POST for the DSI CLKOUT_TIMING_CTRL register.
+		 * The msm_dsi_dphy_timing_calc() values are 2-6x larger
+		 * and keep the DSI link dead on this panel.
+		 */
+		qcom,dphy-timing-ctrl = /bits/ 32 <0x43 0x08 0x02 0x00
+					     0x1e 0x22 0x06 0x0a
+					     0x03 0x03 0x04 0x00>;
+		qcom,dphy-clk-pre = <0x10>;
+		qcom,dphy-clk-post = <0x07>;
 	};
 };
 
@@ -404,15 +522,17 @@
 	/*
 	 * MDSS clocks were previously all protected (unregistered) so the
 	 * clk framework could not gate off what lk2nd programmed while
-	 * nothing claimed them. The DSI/PHY drivers now need them
-	 * registered, so only GCC_MDP_TBU_CLK (MDP SMMU translation
-	 * buffer, claimed by the future MDP3 driver) stays protected.
+	 * nothing claimed them.  Everything MDSS is now owned by drivers;
+	 * clk_ignore_unused on the cmdline still guards the lk2nd state.
 	 *
-	 * Boot with clk_ignore_unused until the MDP3 DRM driver owns the
-	 * whole display path, or the late_initcall clock sweep gates the
-	 * lk2nd state and the panel freezes mid-boot.
+	 * m2t: GCC_MDP_TBU_CLK UN-protected (registered, still unclaimed):
+	 * the m2s probe showed MDSS fetches hang with NO SMMU fault latched
+	 * (CB4 enabled, TTBR0 valid, FSR clean) - consistent with the fetch
+	 * dying inside a clock-gated MDP TBU after qcom_iommu's
+	 * restore_sec_cfg switched the MDSS port from bypass to CB4
+	 * translation.  Registering it lets the dsi_host fetch probe read
+	 * and vote on it (APCS 0x4500c BIT(4)) through the clk framework.
 	 */
-	protected-clocks = <GCC_MDP_TBU_CLK>;
 };
 
 &tlmm {
