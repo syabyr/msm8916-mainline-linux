@@ -6,6 +6,7 @@
 #include <dt-bindings/clock/qcom,dsi-phy-28nm.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/printk.h>
 
 #include "dsi_phy.h"
 #include "dsi.xml.h"
@@ -478,6 +479,21 @@ static int dsi_pll_28nm_vco_prepare_lp(struct clk_hw *hw)
 	if (unlikely(pll_28nm->phy->pll_on))
 		return 0;
 
+	/* W1A lk2nd handoff (m2w): the bootloader leaves the PLL locked and
+	 * its SDM/rate registers programmed.  The reset + power-cycle below
+	 * discards that state and the relock then fails because no
+	 * clk_set_rate() ever ran to reprogram the rate registers (the dsi
+	 * host inherit path skips set_rate) - seen as "DSI PLL lock failed"
+	 * -> -EINVAL from clk_prepare_enable(byte_clk) -> host power_on fail
+	 * -> every panel command -EINVAL (m2v black screen).  An already
+	 * locked VCO needs nothing: mark it on and let the clk framework
+	 * take its refcount. */
+	if (dsi_pll_28nm_clk_is_enabled(hw)) {
+		dev_info(dev, "MDP3DBG pll inherit: VCO already locked, skipping reprogram\n");
+		pll_28nm->phy->pll_on = true;
+		return 0;
+	}
+
 	pll_28nm_software_reset(pll_28nm);
 
 	/*
@@ -769,6 +785,8 @@ static void dsi_28nm_phy_regulator_enable_ldo(struct msm_dsi_phy *phy)
 
 	writel(0x0, base + REG_DSI_28nm_PHY_REGULATOR_CTRL_0);
 	writel(0, base + REG_DSI_28nm_PHY_REGULATOR_CAL_PWR_CFG);
+	/* h/w recommended delay (lk2nd: mdss_dsi_phy_regulator_init) */
+	udelay(1000);
 	writel(0x7, base + REG_DSI_28nm_PHY_REGULATOR_CTRL_5);
 	writel(0, base + REG_DSI_28nm_PHY_REGULATOR_CTRL_3);
 	writel(0x1, base + REG_DSI_28nm_PHY_REGULATOR_CTRL_2);
@@ -803,6 +821,66 @@ static int dsi_28nm_phy_enable(struct msm_dsi_phy *phy,
 	u32 val;
 
 	DBG("");
+
+	if (phy->timing_override) {
+		/*
+		 * Vendor-provided timing (raw GCDB register values): follow
+		 * lk2nd's proven mdss_dsi_phy_28nm_init sequence instead of
+		 * the calculated one.  The calculated v1 timings are 2-6x
+		 * larger than the vendor table for the same link rate and
+		 * were shown to keep the DSI link dead on MSM8909-class
+		 * PHYs (every panel init command times out).
+		 */
+		static const u32 bist_ctrl[6] = {
+			0x00, 0x00, 0xb1, 0xff, 0x00, 0x00
+		};
+
+		dev_info(&phy->pdev->dev,
+			 "MDP3DBG phy vendor enable: start (timing[0]=%08x)\n",
+			 phy->timing_regs[0]);
+
+		writel(0x5b, base + REG_DSI_28nm_PHY_CTRL_0);
+		writel(0xff, base + REG_DSI_28nm_PHY_STRENGTH_0);
+
+		dsi_28nm_phy_regulator_ctrl(phy, true);
+
+		for (i = 0; i < 12; i++)
+			writel(phy->timing_regs[i],
+			       base + REG_DSI_28nm_PHY_TIMING_CTRL_0 + 4 * i);
+
+		for (i = 0; i < 4; i++) {
+			writel(0, base + REG_DSI_28nm_PHY_LN_CFG_0(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_CFG_1(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_CFG_2(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_CFG_3(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_CFG_4(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_TEST_DATAPATH(i));
+			writel(0, base + REG_DSI_28nm_PHY_LN_DEBUG_SEL(i));
+			writel(0x1, base + REG_DSI_28nm_PHY_LN_TEST_STR_0(i));
+			writel(0x97, base + REG_DSI_28nm_PHY_LN_TEST_STR_1(i));
+		}
+
+		writel(0, base + REG_DSI_28nm_PHY_LNCK_CFG_4);
+		writel(0xc0, base + REG_DSI_28nm_PHY_LNCK_CFG_1);
+		writel(0x1, base + REG_DSI_28nm_PHY_LNCK_TEST_STR0);
+		writel(0xbb, base + REG_DSI_28nm_PHY_LNCK_TEST_STR1);
+
+		writel(0x0a, base + REG_DSI_28nm_PHY_CTRL_4);
+
+		writel(0x01, base + REG_DSI_28nm_PHY_GLBL_TEST_CTRL);
+
+		writel(0x5f, base + REG_DSI_28nm_PHY_CTRL_0);
+
+		writel(0x6, base + REG_DSI_28nm_PHY_STRENGTH_1);
+
+		for (i = 0; i < 6; i++)
+			writel(bist_ctrl[i],
+			       base + REG_DSI_28nm_PHY_BIST_CTRL_0 + 4 * i);
+
+		dev_info(&phy->pdev->dev, "MDP3DBG phy vendor enable: done\n");
+
+		return 0;
+	}
 
 	if (msm_dsi_dphy_timing_calc(timing, clk_req)) {
 		DRM_DEV_ERROR(&phy->pdev->dev,

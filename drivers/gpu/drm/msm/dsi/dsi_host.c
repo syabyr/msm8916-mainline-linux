@@ -8,15 +8,18 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/of_irq.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/pm_opp.h>
+#include <linux/printk.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spinlock.h>
+extern void w1a_mb(const char *fmt, ...); /* W1A mailbox */
 
 #include <video/mipi_display.h>
 
@@ -33,6 +36,68 @@
 #include "phy/dsi_phy.h"
 
 #define DSI_RESET_TOGGLE_DELAY_MS 20
+
+/* W1A bring-up (m2o): route the panel command DMA through a raw physical
+ * address instead of the KMS vm iova.  m2n evidence: with DMA_BASE = the
+ * CB4 iova (0x1000) the very first init command wedged the command engine
+ * busy forever (-110, status0=0x3 engine+DMA busy, all lane FIFOs empty,
+ * zero iommu faults) while lk2nd drives the identical transfers with plain
+ * PAs - and the MDP3 DMA_P fetch of the FB iova (0x2000) hangs the same
+ * way.  Conclusion under test: on msm8909 the MDSS port fetches are NOT
+ * translated by apps_iommu CB4, so the DMA_BASE register must hold a real
+ * PA.  The buffer is dma_alloc_coherent() on the DSI ctrl platform device
+ * (no iommus in DT -> direct-mapped, dma addr == PA), exactly like the
+ * downstream mdss_smmu_dsi_alloc_buf kzalloc+virt_to_phys scheme.
+ * "w1a.no_dsi_pa" on the cmdline restores the iova path for A/B testing. */
+static bool w1a_dsi_pa = true;
+static int __init w1a_no_dsi_pa_setup(char *s)
+{
+	w1a_dsi_pa = false;
+	return 1;
+}
+__setup("w1a.no_dsi_pa", w1a_no_dsi_pa_setup);
+
+/* W1A bring-up (m2p): do NOT set DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST.
+ * The lk2nd panel data for this exact panel
+ * (lk_panel_rm67162_wqvga_cmd.h) has force_clk_lane_hs = 0, i.e. the
+ * proven-working path sends the LP panel-init commands with LANE_CTRL
+ * clean.  With BIT(28) set the very first init command wedges the
+ * command engine busy forever: m2n/m2o failure dumps show
+ * lane_ctrl=0x10000000, status0=0x3 (engine+DMA busy), all lane FIFOs
+ * empty - the transfer never starts on the wire (LP command vs a clock
+ * lane pinned HS).  Downstream 8909 op_mode_config also zeroes LANE_CTRL
+ * before enabling the controller.  Mainline sets the bit for every
+ * continuous-clock panel and never clears it; msm8909 is 6G v1.2 where
+ * no mainline DSI device exists to prove that safe.  "w1a.clkhs" on the
+ * cmdline restores the upstream behavior for A/B testing. */
+static bool w1a_dsi_noclkhs = true;
+static int __init w1a_clkhs_setup(char *s)
+{
+	w1a_dsi_noclkhs = false;
+	return 1;
+}
+__setup("w1a.clkhs", w1a_clkhs_setup);
+
+/* W1A bring-up m2r: INHERIT mode.  The m2q handoff dump proved our
+ * programmed DSI register state matches lk2nd's working state almost
+ * register-for-register, yet the very first command (type=0x23) wedges
+ * with status0=0x3 and all FIFOs empty - the fetch never happens.
+ * Everything our power-on does beyond lk2nd is: phy re-init (lane
+ * timing/ULPS writes), link-clock set_rate (which WARNs "rcg didn't
+ * update its configuration" on pclk0/byte0 right before the failure),
+ * sw_reset and ctrl re-programming.  In inherit mode we skip ALL of
+ * that and issue the panel commands on the pristine lk2nd state: if
+ * they go through, one of those re-init steps is the killer (bisect
+ * next); if they still wedge, the cause is systemic (SMMU CB4 attach
+ * at kms init, bus state) and lives outside the DSI programming.
+ * "w1a.no_dsi_inherit" restores the upstream flow for A/B testing. */
+bool w1a_dsi_inherit = true;
+static int __init w1a_no_dsi_inherit_setup(char *s)
+{
+	w1a_dsi_inherit = false;
+	return 1;
+}
+__setup("w1a.no_dsi_inherit", w1a_no_dsi_inherit_setup);
 
 static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc);
 
@@ -871,13 +936,25 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 			DSI_CMD_DMA_CTRL_LOW_POWER);
 
 	data = 0;
-	/* Always assume dedicated TE pin */
-	data |= DSI_TRIG_CTRL_TE;
+	/*
+	 * 6G v1.x (MSM8909/8916 family): do NOT set the dedicated-TE trigger
+	 * bit nor BLOCK_DMA_WITHIN_FRAME.  The downstream 8909 driver only
+	 * sets TRIG_CTRL bit 31 when the panel data selects a TE pin, and
+	 * never sets bit 12 at all; the W1A RM67162 command-mode panel has
+	 * no TE wiring (te_sel unset, mdp_trigger=0, dma_trigger=4), giving
+	 * the proven stock value TRIG_CTRL=0x04.  With the TE bit set, an
+	 * armed command DMA waits for a TE edge that never arrives: every
+	 * panel init command times out with -110 (dsi_cmds2buf_tx) and the
+	 * command engine stays busy forever.
+	 */
+	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
+	    (cfg_hnd->minor > MSM_DSI_6G_VER_MINOR_V1_3_1))
+		data |= DSI_TRIG_CTRL_TE;
 	data |= DSI_TRIG_CTRL_MDP_TRIGGER(TRIGGER_NONE);
 	data |= DSI_TRIG_CTRL_DMA_TRIGGER(TRIGGER_SW);
 	data |= DSI_TRIG_CTRL_STREAM(msm_host->channel);
 	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
-		(cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2))
+	    (cfg_hnd->minor > MSM_DSI_6G_VER_MINOR_V1_3_1))
 		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
 	dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
 
@@ -917,8 +994,17 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		if (msm_dsi_phy_set_continuous_clock(phy, true))
 			lane_ctrl &= ~DSI_LANE_CTRL_HS_REQ_SEL_PHY;
 
-		dsi_write(msm_host, REG_DSI_LANE_CTRL,
-			lane_ctrl | DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST);
+		if (w1a_dsi_noclkhs)
+			/* W1A (m2p): keep LANE_CTRL clean like lk2nd, see
+			 * the comment at the w1a_dsi_noclkhs definition */
+			lane_ctrl &= ~DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+		else
+			lane_ctrl |= DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+
+		dsi_write(msm_host, REG_DSI_LANE_CTRL, lane_ctrl);
+
+		pr_info("MDP3DBG dsi ctrl_enable: LANE_CTRL=%08x (noclkhs=%d)\n",
+			lane_ctrl, w1a_dsi_noclkhs);
 	}
 
 	data |= DSI_CTRL_ENABLE;
@@ -1243,6 +1329,22 @@ int dsi_tx_buf_alloc_6g(struct msm_dsi_host *msm_host, int size)
 	uint64_t iova;
 	u8 *data;
 
+	if (w1a_dsi_pa) {
+		/* W1A: plain PA buffer on the DSI ctrl device (no iommus
+		 * in DT -> dma addr == physical address), see the comment
+		 * at the w1a_dsi_pa definition */
+		msm_host->tx_buf = dma_alloc_coherent(&msm_host->pdev->dev,
+					size, &msm_host->tx_buf_paddr,
+					GFP_KERNEL);
+		if (!msm_host->tx_buf)
+			return -ENOMEM;
+
+		msm_host->tx_size = size;
+		pr_info("MDP3DBG dsi tx buf: raw-PA path (w1a), paddr=%pad size=%d\n",
+			&msm_host->tx_buf_paddr, size);
+		return 0;
+	}
+
 	msm_host->vm = drm_gpuvm_get(priv->kms->vm);
 
 	data = msm_gem_kernel_new(dev, size, MSM_BO_WC,
@@ -1296,13 +1398,23 @@ void msm_dsi_tx_buf_free(struct mipi_dsi_host *host)
 		msm_host->vm = NULL;
 	}
 
-	if (msm_host->tx_buf)
-		dma_free_coherent(dev->dev, msm_host->tx_size, msm_host->tx_buf,
-			msm_host->tx_buf_paddr);
+	if (msm_host->tx_buf) {
+		if (w1a_dsi_pa)
+			dma_free_coherent(&msm_host->pdev->dev,
+					msm_host->tx_size, msm_host->tx_buf,
+					msm_host->tx_buf_paddr);
+		else
+			dma_free_coherent(dev->dev, msm_host->tx_size,
+					msm_host->tx_buf,
+					msm_host->tx_buf_paddr);
+	}
 }
 
 void *dsi_tx_buf_get_6g(struct msm_dsi_host *msm_host)
 {
+	if (w1a_dsi_pa)
+		return msm_host->tx_buf;
+
 	return msm_gem_get_vaddr(msm_host->tx_gem_obj);
 }
 
@@ -1313,6 +1425,9 @@ void *dsi_tx_buf_get_v2(struct msm_dsi_host *msm_host)
 
 void dsi_tx_buf_put_6g(struct msm_dsi_host *msm_host)
 {
+	if (w1a_dsi_pa)
+		return;
+
 	msm_gem_put_vaddr(msm_host->tx_gem_obj);
 }
 
@@ -1423,6 +1538,11 @@ int dsi_dma_base_get_6g(struct msm_dsi_host *msm_host, uint64_t *dma_base)
 	if (!dma_base)
 		return -EINVAL;
 
+	if (w1a_dsi_pa) {
+		*dma_base = msm_host->tx_buf_paddr;
+		return 0;
+	}
+
 	return msm_gem_get_and_pin_iova(msm_host->tx_gem_obj,
 				priv->kms->vm, dma_base);
 }
@@ -1519,6 +1639,167 @@ static int dsi_cmd_dma_rx(struct msm_dsi_host *msm_host,
 	return j;
 }
 
+/* W1A bring-up (m2s): after the first -110 the cmd engine is wedged busy
+ * with all lane FIFOs empty - the AXI fetch of the command packet never
+ * completes, even though every DSI register is bit-identical to lk2nd's
+ * working handoff state (m2q) and nothing was reprogrammed at all (m2r
+ * inherit mode).  The cause is systemic.  This one-shot probe runs at the
+ * first failure and answers, in one boot:
+ *   E) what SMMU CB4 (apps_iommu ctx 4, mdp3's bank) says: enabled?
+ *      latched translation fault (FSR/FAR) from the DSI fetch?
+ *   A) whether the wedged cmd engine can be soft-reset at all
+ *   B) whether a clean retry on a fully-restored lk2nd register state
+ *      (fresh trigger, same buffer PA) goes through
+ *   C) whether a fetch from lk2nd's own last DMA address 0x8f68f700
+ *      (/memreserve/d in the DTS, our packet copied there) goes through
+ * A/B/C restore the exact m2q dump values after the reset so a failure
+ * cannot be blamed on missing configuration. */
+static void w1a_restore_lk2nd(struct msm_dsi_host *msm_host)
+{
+	/* exact values from the m2q/m2r handoff + fail dumps */
+	dsi_write(msm_host, REG_DSI_CTRL, 0x115);
+	dsi_write(msm_host, REG_DSI_CLK_CTRL, 0x23f);
+	dsi_write(msm_host, REG_DSI_TRIG_CTRL, 0x4);
+	dsi_write(msm_host, REG_DSI_CMD_DMA_CTRL, 0x14000000);
+	dsi_write(msm_host, REG_DSI_CMD_CFG0, 0x8);
+	dsi_write(msm_host, REG_DSI_CMD_CFG1, 0x13c2c);
+	dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL, 0x04b10039);
+	dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL, 0x01900190);
+	dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL, 0x04b10039);
+	dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM1_TOTAL, 0x01900190);
+	dsi_write(msm_host, REG_DSI_LANE_CTRL, 0x0);
+	dsi_write(msm_host, REG_DSI_LP_TIMER_CTRL, 0xffffffff);
+	dsi_write(msm_host, REG_DSI_HS_TIMER_CTRL, 0x0000ffff);
+	dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, 0x1);
+	dsi_write(msm_host, REG_DSI_CLKOUT_TIMING_CTRL, 0x710);
+	dsi_write(msm_host, REG_DSI_EOT_PACKET_CTRL, 0x1);
+	dsi_write(msm_host, REG_DSI_ERR_INT_MASK0, 0x03f03be0);
+	/* arm CMD_DMA_DONE + CMD_MDP_DONE (the observed mainline masks) */
+	dsi_write(msm_host, REG_DSI_INTR_CTRL, 0x202);
+	wmb();
+}
+
+static void w1a_fetch_probe(struct msm_dsi_host *msm_host, int len)
+{
+	static bool done;
+	void __iomem *cb4;
+	u32 hw_ver, ret;
+	u32 pkt = 0;
+
+	if (done)
+		return;
+	done = true;
+
+	/* E: SMMU CB4 state - read-only, never write SMMU regs */
+	cb4 = ioremap(0x01e24000, 0x100);
+	if (cb4) {
+		u32 sctlr = readl(cb4 + 0x00);  /* CB_SCTLR */
+		u32 ttbr0 = readl(cb4 + 0x20);  /* CB_TTBR0 low 32 bits */
+		u32 fsr   = readl(cb4 + 0x58);  /* CB_FSR */
+		u32 far   = readl(cb4 + 0x60);  /* CB_FAR */
+		u32 fsynr0 = readl(cb4 + 0x68); /* CB_FSYNR0 */
+		pr_info("MDP3DBG probe CB4: sctlr=%08x ttbr0=%08x fsr=%08x far=%08x fsynr0=%08x\n",
+			sctlr, ttbr0, fsr, far, fsynr0);
+		if (fsr & BIT(31))
+			pr_info("MDP3DBG probe CB4: *** FAULT LATCHED, far=%08x - the fetch was SMMU-translated and faulted ***\n",
+				far);
+		iounmap(cb4);
+	} else {
+		pr_err("MDP3DBG probe CB4: ioremap failed\n");
+	}
+
+	/* m2u: MDSS AXI-path clock votes, read at first-fail time (AFTER the
+	 * qcom_iommu attach that now also enables the DT "tbu" clock).
+	 * APCS SMMU CLOCK_BRANCH_ENA_VOTE @ 0x0184500c, BIT(4)=mdp_tbu,
+	 * BIT(1)=apss_tcu - same reg the clk framework writes for every
+	 * voted-branch enable.  m2t lesson: clk_get_sys cannot see
+	 * DT-registered clocks (no clkdev entry) - read the vote reg.
+	 */
+	{
+		void __iomem *vote = ioremap(0x01845000, 0x10);
+
+		if (vote) {
+			u32 v = readl(vote + 0x0c);
+
+			pr_info("MDP3DBG probe vote %08x: mdp_tbu(BIT4)=%d apss_tcu(BIT1)=%d\n",
+				v, !!(v & BIT(4)), !!(v & BIT(1)));
+			iounmap(vote);
+		} else {
+			pr_err("MDP3DBG probe vote: ioremap failed\n");
+		}
+	}
+
+	hw_ver = readl(msm_host->ctrl_base - 4); /* 6G_HW_VERSION at raw offset 0 */
+	memcpy(&pkt, msm_host->tx_buf, min(len, 4));
+	pr_info("MDP3DBG probe hw: 6G_HW_VERSION=%08x pkt=%08x len=%d\n",
+		hw_ver, pkt, len);
+
+	/* A: can the wedged engine be soft-reset? */
+	dsi_sw_reset(msm_host);
+	pr_info("MDP3DBG probe A after sw_reset: ctrl=%08x status0=%08x\n",
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0));
+	w1a_restore_lk2nd(msm_host);
+	pr_info("MDP3DBG probe A after restore: ctrl=%08x status0=%08x\n",
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0));
+
+	/* B: clean retry, same buffer */
+	reinit_completion(&msm_host->dma_comp);
+	dsi_write(msm_host, REG_DSI_DMA_BASE, lower_32_bits(msm_host->tx_buf_paddr));
+	dsi_write(msm_host, REG_DSI_DMA_LEN, len);
+	wmb();
+	dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
+	wmb();
+	ret = wait_for_completion_timeout(&msm_host->dma_comp,
+					  msecs_to_jiffies(200));
+	pr_info("MDP3DBG probe B retry (paddr=%pad): %s status0=%08x fifo=%08x\n",
+		&msm_host->tx_buf_paddr,
+		ret ? "COMPLETED" : "TIMEOUT",
+		dsi_read(msm_host, REG_DSI_STATUS0),
+		dsi_read(msm_host, REG_DSI_FIFO_STATUS));
+	if (!ret) {
+		/* engine wedged again - reset before the next test */
+		dsi_sw_reset(msm_host);
+		w1a_restore_lk2nd(msm_host);
+	}
+
+	/* C: fetch from lk2nd's own last DMA address.
+	 * m2u: __va + dma_map_single - arm32 ioremap AND memremap both
+	 * refuse RAM pages (m2s/m2t probe C never ran).  The page is
+	 * /memreserve/d so nothing allocates it; the direct map covers it
+	 * (pfn_valid - that's exactly why ioremap refuses).  dma_map does
+	 * the cache clean so the AXI fetch sees the packet. */
+	{
+		void *cbuf = __va(0x08f68f700);
+		dma_addr_t cdma;
+
+		memcpy(cbuf, &pkt, sizeof(pkt));
+		cdma = dma_map_single(&msm_host->pdev->dev, cbuf,
+				      sizeof(pkt), DMA_TO_DEVICE);
+		if (!dma_mapping_error(&msm_host->pdev->dev, cdma)) {
+			pr_info("MDP3DBG probe C: lk2nd-pa dma %pad\n", &cdma);
+			reinit_completion(&msm_host->dma_comp);
+			dsi_write(msm_host, REG_DSI_DMA_BASE,
+				  lower_32_bits(cdma));
+			dsi_write(msm_host, REG_DSI_DMA_LEN, sizeof(pkt));
+			wmb();
+			dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
+			wmb();
+			ret = wait_for_completion_timeout(&msm_host->dma_comp,
+							  msecs_to_jiffies(200));
+			pr_info("MDP3DBG probe C lk2nd-pa 0x8f68f700 fetch: %s status0=%08x fifo=%08x\n",
+				ret ? "COMPLETED" : "TIMEOUT",
+				dsi_read(msm_host, REG_DSI_STATUS0),
+				dsi_read(msm_host, REG_DSI_FIFO_STATUS));
+			dma_unmap_single(&msm_host->pdev->dev, cdma,
+					 sizeof(pkt), DMA_TO_DEVICE);
+		} else {
+			pr_err("MDP3DBG probe C: dma_map failed\n");
+		}
+	}
+}
+
 static int dsi_cmds2buf_tx(struct msm_dsi_host *msm_host,
 				const struct mipi_dsi_msg *msg)
 {
@@ -1553,6 +1834,45 @@ static int dsi_cmds2buf_tx(struct msm_dsi_host *msm_host,
 	if (ret < 0) {
 		pr_err("%s: cmd dma tx failed, type=0x%x, data0=0x%x, len=%d, ret=%d\n",
 			__func__, msg->type, (*(u8 *)(msg->tx_buf)), len, ret);
+		/* W1A bring-up: dump the link state that produced the
+		 * failure - CLK_STATUS shows the byte/pixel/esc clock
+		 * domains, LANE_CTRL/CMD DMA state shows how far the
+		 * transfer got. */
+		pr_err("MDP3DBG cmd fail dump: ctrl=%08x status0=%08x fifo=%08x clk_status=%08x\n",
+			dsi_read(msm_host, REG_DSI_CTRL),
+			dsi_read(msm_host, REG_DSI_STATUS0),
+			dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+			dsi_read(msm_host, REG_DSI_CLK_STATUS));
+		pr_err("MDP3DBG cmd fail dump: lane_ctrl=%08x trig=%08x dma_base=%08x dma_len=%08x int_ctrl=%08x\n",
+			dsi_read(msm_host, REG_DSI_LANE_CTRL),
+			dsi_read(msm_host, REG_DSI_TRIG_CTRL),
+			dsi_read(msm_host, REG_DSI_DMA_BASE),
+			dsi_read(msm_host, REG_DSI_DMA_LEN),
+			dsi_read(msm_host, REG_DSI_INTR_CTRL));
+		/* m2q: the same register set as the "lk2nd dsi" probe dump in
+		 * mdp3_kms.c, so the two can be diffed line by line.  The
+		 * watermark register (xml 0x4c, raw 0x1ac8050) has no xml
+		 * define - downstream mdss_dsi_host.c writes 0x30 there. */
+		pr_err("MDP3DBG cmd fail dump2: dma_ctrl=%08x cfg0=%08x cfg1=%08x wm4c=%08x\n",
+			dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL),
+			dsi_read(msm_host, REG_DSI_CMD_CFG0),
+			dsi_read(msm_host, REG_DSI_CMD_CFG1),
+			dsi_read(msm_host, 0x4c));
+		pr_err("MDP3DBG cmd fail dump3: str0ctl=%08x str0tot=%08x str1ctl=%08x str1tot=%08x ackerr=%08x phyerr=%08x\n",
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL),
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL),
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL),
+			dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM1_TOTAL),
+			dsi_read(msm_host, REG_DSI_ACK_ERR_STATUS),
+			dsi_read(msm_host, REG_DSI_DLN0_PHY_ERR));
+		pr_err("MDP3DBG cmd fail dump4: lptim=%08x hstim=%08x tmo=%08x clkout=%08x eot=%08x errmask=%08x\n",
+			dsi_read(msm_host, REG_DSI_LP_TIMER_CTRL),
+			dsi_read(msm_host, REG_DSI_HS_TIMER_CTRL),
+			dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS),
+			dsi_read(msm_host, REG_DSI_CLKOUT_TIMING_CTRL),
+			dsi_read(msm_host, REG_DSI_EOT_PACKET_CTRL),
+			dsi_read(msm_host, REG_DSI_ERR_INT_MASK0));
+		w1a_fetch_probe(msm_host, len);
 		return ret;
 	} else if (ret < len) {
 		pr_err("%s: cmd dma tx failed, type=0x%x, data0=0x%x, ret=%d len=%d\n",
@@ -2409,8 +2729,12 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	pr_info("MDP3DBG dsi_host_enable (op_mode_config)\n");
+	w1a_mb("dsi_host enable (op_mode_config)");
 	dsi_op_mode_config(msm_host,
 		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), true);
+	pr_info("MDP3DBG dsi_host_enable done\n");
+	w1a_mb("dsi_host enable done");
 
 	/* TODO: clock should be turned off for command mode,
 	 * and only turned on before MDP START.
@@ -2470,6 +2794,9 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		goto unlock_ret;
 	}
 
+	pr_info("MDP3DBG dsi_host_power_on\n");
+	w1a_mb("dsi_host power_on (timing+reset+ctrl next)");
+
 	msm_host->byte_intf_clk_rate = msm_host->byte_clk_rate;
 	if (phy_shared_timings->byte_intf_clk_div_2)
 		msm_host->byte_intf_clk_rate /= 2;
@@ -2485,6 +2812,27 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	}
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
+
+	if (w1a_dsi_inherit) {
+		/* m2r: keep the lk2nd handoff state untouched - no set_rate
+		 * (the RCG update WARNs show it fails mid-update anyway),
+		 * no timing_setup, no sw_reset, no ctrl_enable.  The link
+		 * clocks are already running with lk2nd's rates; only take
+		 * enable refcounts so pm-symmetric teardown still works. */
+		pr_info("MDP3DBG dsi power_on INHERIT: skipping set_rate/timing/sw_reset/ctrl_enable, ctrl=%08x status0=%08x\n",
+			dsi_read(msm_host, REG_DSI_CTRL),
+			dsi_read(msm_host, REG_DSI_STATUS0));
+		ret = cfg_hnd->ops->link_clk_enable(msm_host);
+		if (ret) {
+			pr_err("%s: inherit: link clk enable failed %d\n",
+			       __func__, ret);
+			goto fail_disable_reg;
+		}
+		msm_host->power_on = true;
+		mutex_unlock(&msm_host->dev_mutex);
+		return 0;
+	}
+
 	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
 	if (!ret)
 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
@@ -2502,8 +2850,15 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	}
 
 	dsi_timing_setup(msm_host, is_bonded_dsi);
+	pr_info("MDP3DBG dsi timing_setup done, sw_reset\n");
+	w1a_mb("dsi timing done, sw_reset next");
 	dsi_sw_reset(msm_host);
+	pr_info("MDP3DBG dsi sw_reset done, ctrl_enable\n");
+	w1a_mb("dsi sw_reset done");
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+	pr_info("MDP3DBG dsi ctrl_enable done: clk_status=%08x status0=%08x\n",
+		dsi_read(msm_host, REG_DSI_CLK_STATUS),
+		dsi_read(msm_host, REG_DSI_STATUS0));
 
 	msm_host->power_on = true;
 	mutex_unlock(&msm_host->dev_mutex);

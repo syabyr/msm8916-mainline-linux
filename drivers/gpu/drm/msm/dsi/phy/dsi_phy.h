@@ -112,6 +112,19 @@ struct msm_dsi_phy {
 	const struct msm_dsi_phy_cfg *cfg;
 	void *tuning_cfg;
 
+	/*
+	 * Optional DPHY timing override with raw register values taken from
+	 * the vendor panel file (GCDB).  When the "qcom,dphy-timing-ctrl"
+	 * property is present, msm_dsi_dphy_timing_calc() is bypassed and
+	 * these 12 dwords are written verbatim to TIMING_CTRL_0..11, and
+	 * clk_pre/clk_post override the shared timings used for the DSI
+	 * CLKOUT_TIMING_CTRL register.
+	 */
+	bool timing_override;
+	u32 timing_regs[12];
+	u32 clk_pre;
+	u32 clk_post;
+
 	enum msm_dsi_phy_usecase usecase;
 	bool regulator_ldo_mode;
 	bool cphy_mode;

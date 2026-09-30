@@ -3,6 +3,10 @@
  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/printk.h>
+extern void w1a_mb(const char *fmt, ...); /* W1A mailbox */
+extern bool w1a_dsi_inherit; /* dsi_host.c: keep lk2nd handoff state (m2r) */
+
 #include "drm/drm_bridge_connector.h"
 
 #include "msm_kms.h"
@@ -220,15 +224,32 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 
 	DBG("id=%d", id);
 
-	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
-	if (ret)
-		goto phy_en_fail;
+	if (w1a_dsi_inherit) {
+		/* m2r: do not touch the PHY/PLL - lk2nd left lanes timed
+		 * and the PLL locked; re-running the 28nm phy power-on is
+		 * one of the suspects for the wedged command fetch.  The
+		 * shared timings stay zeroed, which only feeds timing
+		 * calculations that the inherit host path skips anyway. */
+		memset(phy_shared_timings, 0, sizeof(phy_shared_timings));
+		dev_info(&msm_dsi->pdev->dev,
+			 "MDP3DBG dsi phy_enable SKIPPED (inherit mode)\n");
+		w1a_mb("dsi phy skipped (inherit)");
+	} else {
+		ret = dsi_mgr_phy_enable(id, phy_shared_timings);
+		if (ret)
+			goto phy_en_fail;
+		dev_info(&msm_dsi->pdev->dev,
+			 "MDP3DBG dsi phy enabled: clk_pre=%u clk_post=%u byte_intf_div2=%d\n",
+			 phy_shared_timings[id].clk_pre, phy_shared_timings[id].clk_post,
+			 phy_shared_timings[id].byte_intf_clk_div_2);
+	}
 
 	ret = msm_dsi_host_power_on(host, &phy_shared_timings[id], is_bonded_dsi, msm_dsi->phy);
 	if (ret) {
 		pr_err("%s: power on host %d failed, %d\n", __func__, id, ret);
 		goto host_on_fail;
 	}
+	dev_info(&msm_dsi->pdev->dev, "MDP3DBG dsi host powered on\n");
 
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_power_on(msm_dsi1->host,
@@ -266,6 +287,8 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	int ret;
 
 	DBG("id=%d", id);
+	dev_info(&msm_dsi->pdev->dev, "MDP3DBG dsi pre_enable\n");
+	w1a_mb("dsi pre_enable");
 
 	/* Do nothing with the host if it is slave-DSI in case of bonded DSI */
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
@@ -276,6 +299,9 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
 		return;
 	}
+
+	dev_info(&msm_dsi->pdev->dev, "MDP3DBG dsi pre_enable done\n");
+	w1a_mb("dsi pre_enable done");
 }
 
 static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
@@ -293,6 +319,8 @@ static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		return;
 
+	dev_info(&msm_dsi->pdev->dev, "MDP3DBG dsi enable\n");
+	w1a_mb("dsi enable (host on/off cmd next)");
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
 		pr_err("%s: enable host %d failed, %d\n", __func__, id, ret);

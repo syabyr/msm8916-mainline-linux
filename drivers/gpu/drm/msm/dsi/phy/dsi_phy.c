@@ -4,10 +4,21 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/init.h>
 #include <linux/platform_device.h>
 #include <linux/pm_clock.h>
 #include <linux/pm_runtime.h>
+#include <linux/printk.h>
 #include <dt-bindings/phy/phy.h>
+
+/* W1A bring-up bisect switch, see dsi_phy_driver_probe() */
+static bool w1a_nodphy;
+static int __init w1a_nodphy_setup(char *s)
+{
+	w1a_nodphy = true;
+	return 1;
+}
+__setup("w1a.nodphy", w1a_nodphy_setup);
 
 #include "dsi_phy.h"
 
@@ -644,6 +655,24 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 	if (!of_property_read_u32(dev->of_node, "phy-type", &phy_type))
 		phy->cphy_mode = (phy_type == PHY_TYPE_CPHY);
 
+	if (!of_property_read_u32_array(dev->of_node, "qcom,dphy-timing-ctrl",
+					phy->timing_regs,
+					ARRAY_SIZE(phy->timing_regs))) {
+		phy->timing_override = true;
+		of_property_read_u32(dev->of_node, "qcom,dphy-clk-pre",
+				     &phy->clk_pre);
+		of_property_read_u32(dev->of_node, "qcom,dphy-clk-post",
+				     &phy->clk_post);
+	}
+
+	/* W1A bring-up bisect: "w1a.nodphy" on the cmdline ignores the
+	 * vendor timing override (behaves like the DT property absent,
+	 * i.e. mainline-calculated timings) without rebuilding the DTB. */
+	if (w1a_nodphy) {
+		dev_info(dev, "MDP3DBG dphy override DISABLED (w1a.nodphy)\n");
+		phy->timing_override = false;
+	}
+
 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
 	if (IS_ERR(phy->base))
 		return dev_err_probe(dev, PTR_ERR(phy->base),
@@ -767,6 +796,16 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 
 	memcpy(shared_timings, &phy->timing.shared_timings,
 	       sizeof(*shared_timings));
+
+	if (phy->timing_override) {
+		/* vendor-provided clock lane timing (T_CLK_PRE/T_CLK_POST) */
+		shared_timings->clk_pre = phy->clk_pre;
+		shared_timings->clk_post = phy->clk_post;
+	}
+
+	dev_info(dev, "MDP3DBG msm_dsi_phy_enable done: clk_pre=%u clk_post=%u override=%d\n",
+		 shared_timings->clk_pre, shared_timings->clk_post,
+		 phy->timing_override);
 
 	/*
 	 * Resetting DSI PHY silently changes its PLL registers to reset status,
