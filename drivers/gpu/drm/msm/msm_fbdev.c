@@ -5,6 +5,7 @@
  */
 
 #include <linux/fb.h>
+#include <linux/printk.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_crtc_helper.h>
@@ -100,9 +101,9 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 
 	format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
 
-	DBG("create fbdev: %dx%d@%d (%dx%d)", sizes->surface_width,
-			sizes->surface_height, sizes->surface_bpp,
-			sizes->fb_width, sizes->fb_height);
+	pr_info("MDP3DBG fbdev_probe: %ux%u@%u entry, stolen fb alloc next\n",
+		sizes->surface_width, sizes->surface_height, sizes->surface_bpp);
+	pr_flush(1000, true);
 
 	pitch = align_pitch(sizes->surface_width, sizes->surface_bpp);
 	fb = msm_alloc_stolen_fb(dev, sizes->surface_width,
@@ -112,6 +113,9 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 		DRM_DEV_ERROR(dev->dev, "failed to allocate fb\n");
 		return PTR_ERR(fb);
 	}
+	pr_info("MDP3DBG fbdev_probe: stolen fb ok (id %u), pin iova next\n",
+		fb->base.id);
+	pr_flush(1000, true);
 
 	bo = msm_framebuffer_bo(fb, 0);
 
@@ -121,6 +125,9 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	 * buffer now:
 	 */
 	ret = msm_gem_get_and_pin_iova(bo, priv->kms->vm, &paddr);
+	pr_info("MDP3DBG fbdev_probe: pin iova done paddr=%llx ret=%d\n",
+		(unsigned long long)paddr, ret);
+	pr_flush(1000, true);
 	if (ret) {
 		DRM_DEV_ERROR(dev->dev, "failed to get buffer obj iova: %d\n", ret);
 		goto fail;
@@ -136,6 +143,9 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	drm_fb_helper_fill_info(fbi, helper, sizes);
 
 	fbi->screen_buffer = msm_gem_get_vaddr(bo);
+	pr_info("MDP3DBG fbdev_probe: get_vaddr done (%px)\n",
+		fbi->screen_buffer);
+	pr_flush(1000, true);
 	if (IS_ERR(fbi->screen_buffer)) {
 		ret = PTR_ERR(fbi->screen_buffer);
 		goto fail;

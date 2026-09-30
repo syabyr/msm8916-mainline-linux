@@ -384,5 +384,7 @@ void msm_drm_kms_post_init(struct device *dev)
 	struct drm_device *ddev = priv->dev;
 
 	drm_kms_helper_poll_init(ddev);
+	pr_info("MDP3DBG post_init: drm_client_setup\n");
 	drm_client_setup(ddev, NULL);
+	pr_info("MDP3DBG post_init: drm_client_setup done\n");
 }

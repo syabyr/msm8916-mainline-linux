@@ -54,6 +54,12 @@ msm-display-$(CONFIG_DRM_MSM_MDP4) += \
 	disp/mdp4/mdp4_kms.o \
 	disp/mdp4/mdp4_plane.o \
 
+msm-display-$(CONFIG_DRM_MSM_MDP3) += \
+	disp/mdp3/mdp3_crtc.o \
+	disp/mdp3/mdp3_dsi_encoder.o \
+	disp/mdp3/mdp3_kms.o \
+	disp/mdp3/mdp3_plane.o \
+
 msm-display-$(CONFIG_DRM_MSM_MDP5) += \
 	disp/mdp5/mdp5_cfg.o \
 	disp/mdp5/mdp5_cmd_encoder.o \

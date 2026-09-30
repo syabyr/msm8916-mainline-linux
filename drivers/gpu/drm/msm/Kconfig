@@ -89,6 +89,17 @@ config DRM_MSM_MDP4
 	  the MSM DRM driver. It is the older display controller found in
 	  devices using APQ8064/MSM8960/MSM8x60 platforms.
 
+config DRM_MSM_MDP3
+	bool "Enable MDP3 support in MSM DRM driver"
+	depends on DRM_MSM
+	select DRM_MSM_KMS
+	default n
+	help
+	  Compile in support for the Mobile Display Processor v3 (MDP3) in
+	  the MSM DRM driver. It is the minimal display engine (a single
+	  RGB fetch pipe to DSI command mode) found in devices using the
+	  MSM8909 platform.
+
 config DRM_MSM_MDP5
 	bool "Enable MDP5 support in MSM DRM driver"
 	depends on DRM_MSM

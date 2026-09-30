@@ -410,6 +410,14 @@ static inline void msm_mdp4_register(void) {}
 static inline void msm_mdp4_unregister(void) {}
 #endif
 
+#ifdef CONFIG_DRM_MSM_MDP3
+void msm_mdp3_register(void);
+void msm_mdp3_unregister(void);
+#else
+static inline void msm_mdp3_register(void) {}
+static inline void msm_mdp3_unregister(void) {}
+#endif
+
 #ifdef CONFIG_DRM_MSM_MDP5
 void msm_mdp_register(void);
 void msm_mdp_unregister(void);

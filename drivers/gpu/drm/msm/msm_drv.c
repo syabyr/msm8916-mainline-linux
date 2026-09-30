@@ -266,12 +266,28 @@ static int context_init(struct drm_device *dev, struct drm_file *file)
 
 static int msm_open(struct drm_device *dev, struct drm_file *file)
 {
+	int ret;
+
 	/* For now, load gpu on open.. to avoid the requirement of having
 	 * firmware in the initrd.
 	 */
 	load_gpu(dev);
 
-	return context_init(dev, file);
+	/* W1A bring-up: bracket the fbdev client's GEM allocation (which
+	 * starts right after this open returns) - the first M2 black-screen
+	 * boot froze somewhere in here with the threaded printk losing the
+	 * tail, so pin this marker down before anything heavy runs. */
+	pr_info("MDP3DBG msm_open: gpu load done\n");
+	pr_flush(1000, true);
+
+	ret = context_init(dev, file);
+	if (ret)
+		return ret;
+
+	pr_info("MDP3DBG msm_open: context_init done, returning\n");
+	pr_flush(1000, true);
+
+	return 0;
 }
 
 static void context_close(struct msm_context *ctx)
@@ -1130,6 +1146,7 @@ static int __init msm_drm_register(void)
 	msm_dp_register();
 	adreno_register();
 	msm_mdp4_register();
+	msm_mdp3_register();
 	msm_mdss_register();
 
 	return 0;
@@ -1140,6 +1157,7 @@ static void __exit msm_drm_unregister(void)
 	DBG("fini");
 	msm_mdss_unregister();
 	msm_mdp4_unregister();
+	msm_mdp3_unregister();
 	msm_dp_unregister();
 	msm_hdmi_unregister();
 	adreno_unregister();
