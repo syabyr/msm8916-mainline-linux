@@ -11,6 +11,7 @@
  * driven by the msm dsi driver) owns the link side.
  */
 
+#include <linux/moduleparam.h>
 #include <linux/printk.h>
 
 #include <drm/drm_crtc.h>
@@ -35,6 +36,17 @@ __setup("w1a.nokick", mdp3_nokick_setup);
 
 /* m3j: first-kick-only marker (see mdp3_crtc_kick) */
 static unsigned int kick_count;
+
+/* m4b: runtime switch for the DSI MDP_SW_TRIGGER poke.  The poke is a
+ * belt-and-braces leftover from bring-up - downstream mdp3 NEVER writes
+ * that register (the DSI-side trigger is routed by ID_MAP/TRIGGER_EN,
+ * programmed in hw_init), and on this panel mdptrig reads back stuck at
+ * 1 since m3 while m4a showed the per-kick path does not deliver frames
+ * at rate without autorefresh.  Default keeps the poke (the state every
+ * verified boot ran with); echo 0 to test the downstream-style pure
+ * DMA_P_START kick. */
+static bool w1a_swtrigger = true;
+module_param(w1a_swtrigger, bool, 0644);
 
 struct mdp3_crtc {
 	struct drm_crtc base;
@@ -87,7 +99,8 @@ void mdp3_crtc_kick(struct drm_crtc *crtc)
 	}
 
 	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
-	mdp3_dsi_trigger(mdp3_kms);
+	if (w1a_swtrigger)
+		mdp3_dsi_trigger(mdp3_kms);
 }
 
 /* if file!=NULL, this is preclose potential cancel-flip path */

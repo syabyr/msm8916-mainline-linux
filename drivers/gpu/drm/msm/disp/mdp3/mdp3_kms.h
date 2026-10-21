@@ -26,6 +26,12 @@ struct mdp3_kms {
 	 * without requesting the region, the msm dsi host owns it */
 	void __iomem *dsi_ctrl;
 
+	/* m4a: commit counter + takeover flag - autorefresh is disarmed at
+	 * the SECOND flush_commit (first frame with our config completed,
+	 * see mdp3_flush_commit) */
+	unsigned int commit_count;
+	bool autorefresh_taken;
+
 	struct clk *core_clk;   /* gcc_mdss_mdp_clk */
 	struct clk *iface_clk;  /* gcc_mdss_ahb_clk */
 	struct clk *bus_clk;    /* gcc_mdss_axi_clk */

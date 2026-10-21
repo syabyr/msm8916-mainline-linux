@@ -55,6 +55,14 @@
 #define REG_MDP3_PRIMARY_VSYNC_INIT_VAL		0x0328
 #define REG_MDP3_AUTOREFRESH_CONFIG_P		0x034c
 
+/* MDP-side DSI command-mode trigger routing (downstream
+ * MDP3_REG_DSI_CMD_MODE_ID_MAP / _TRIGGER_EN @ 0xF1000/0xF1004, inside
+ * the core reg space).  lk2nd writes ID_MAP=0x10 / TRIGGER_EN=0x11 to
+ * route autorefresh and software triggers to the DSI command engine -
+ * the proven-working pair for this panel. */
+#define REG_MDP3_DSI_CMD_MODE_ID_MAP		0xf1000
+#define REG_MDP3_DSI_CMD_MODE_TRIGGER_EN	0xf1004
+
 /* DMA_P fetch engine (offset 0x90000 inside the core reg space) */
 #define REG_MDP3_DMA_P_CONFIG			0x90000
 #define REG_MDP3_DMA_P_SIZE			0x90004

@@ -70,6 +70,55 @@ static unsigned int w1a_hb_stalls;
 static struct delayed_work w1a_hb_work;
 static struct hrtimer w1a_hb_timer;
 
+/* m4b: runtime autorefresh control, applied at the 2nd-commit takeover
+ * (see mdp3_flush_commit) and live afterwards via
+ * /sys/module/msm/parameters/w1a_autorefresh:
+ *   0 = disarmed - per-commit kicks are the only frame source
+ *   N = armed at 60/N fps (lk2nd's splash config: BIT(28)|1 = 60Hz)
+ * Default 1 because m4a unmasked the truth: with autorefresh disarmed
+ * the per-kick path delivered fps 3-13 (and m3h, autorefresh accidentally
+ * off, showed 1-9 + frozen screen) while every "working" boot since m3g
+ * had lk2nd's 60Hz autorefresh silently re-fetching our buffer.  The
+ * screen works out of the box with this default; the kick path is the
+ * thing under investigation. */
+static struct mdp3_kms *w1a_kms;
+static unsigned int w1a_autorefresh = 1;
+
+static int w1a_autorefresh_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	int ret;
+
+	ret = kstrtouint(val, 0, &v);
+	if (ret)
+		return ret;
+	*(unsigned int *)kp->arg = v;
+
+	if (w1a_kms && w1a_kms->autorefresh_taken) {
+		u32 reg = v ? (BIT(28) | v) : 0;
+		u32 was = mdp3_read(w1a_kms, REG_MDP3_AUTOREFRESH_CONFIG_P);
+
+		if (was != reg) {
+			mdp3_write(w1a_kms, REG_MDP3_AUTOREFRESH_CONFIG_P, reg);
+			pr_info("MDP3DBG m4b: autorefresh=%u reg %08x -> %08x\n",
+				v, was, reg);
+		}
+	}
+	return 0;
+}
+
+static int w1a_autorefresh_get(char *buffer, const struct kernel_param *kp)
+{
+	return scnprintf(buffer, PAGE_SIZE, "%u",
+			 *(unsigned int *)kp->arg);
+}
+
+static const struct kernel_param_ops w1a_autorefresh_ops = {
+	.set = w1a_autorefresh_set,
+	.get = w1a_autorefresh_get,
+};
+module_param_cb(w1a_autorefresh, &w1a_autorefresh_ops, &w1a_autorefresh, 0644);
+
 /*
  * W1A bring-up mailbox, v3.  printk records only reach the ramoops
  * console via the printk kthread, which needs console_lock - and the
@@ -283,14 +332,21 @@ static int mdp3_hw_init(struct msm_kms *kms)
 	}
 
 	/* lk2nd arms the DMA_P autorefresh fetcher before jumping to the
-	 * kernel (AUTOREFRESH_CONFIG_P=0x10000001, IBUF=lk2nd's buffer at
-	 * 0x83200000).  m2k/m2l DISARMED it here and those are exactly the
-	 * boots that die inside the first commit - writing 0 to the config
-	 * while a refresh cycle is mid-flight is not a documented-safe
-	 * operation, and the v2 boot survived with it left armed (SMMU
-	 * attached, 160ms of runtime).  So: hands off.  Once the commit
-	 * rewrites DMA_P config + IBUF, autorefresh refreshes OUR buffer -
-	 * which is what command-mode panels want anyway. */
+	 * kernel (AUTOREFRESH_CONFIG_P=BIT(28)|interval, IBUF=lk2nd's
+	 * buffer at 0x83200000).  m2k/m2l DISARMED it here and those are
+	 * exactly the boots that die inside the first commit - writing 0
+	 * to the config while a refresh cycle is mid-flight is not a
+	 * documented-safe operation.  So: hands off at init.  Once the
+	 * commit rewrites DMA_P config + IBUF, autorefresh refreshes OUR
+	 * buffer; m4a disarms it deterministically after the first frame
+	 * with our config has landed (see mdp3_flush_commit). */
+	mdp3_write(mdp3_kms, REG_MDP3_DSI_CMD_MODE_ID_MAP, 0x10);
+	mdp3_write(mdp3_kms, REG_MDP3_DSI_CMD_MODE_TRIGGER_EN, 0x11);
+	pr_info("MDP3DBG m4a: autorefresh=%08x id_map=%08x trig_en=%08x (routing programmed, takeover at 2nd commit)\n",
+		mdp3_read(mdp3_kms, REG_MDP3_AUTOREFRESH_CONFIG_P),
+		mdp3_read(mdp3_kms, REG_MDP3_DSI_CMD_MODE_ID_MAP),
+		mdp3_read(mdp3_kms, REG_MDP3_DSI_CMD_MODE_TRIGGER_EN));
+	w1a_kms = mdp3_kms;	/* m4b: for the w1a_autorefresh param callback */
 	version = mdp3_read(mdp3_kms, REG_MDP3_HW_VERSION);
 	DRM_DEV_INFO(dev->dev, "MDP3 HW_VERSION 0x%08x", version);
 	pr_info("MDP3DBG hw_init done (autorefresh LEFT ARMED)\n");
@@ -453,6 +509,28 @@ static void mdp3_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
 	 * first modeset, too early to kick.) */
 	for_each_crtc_mask(mdp3_kms->dev, crtc, crtc_mask)
 		mdp3_crtc_kick(crtc);
+
+	/* m4a/m4b: lk2nd leaves the autorefresh fetcher armed (splash
+	 * screen self-refresh).  The first commit above rewrote DMA_P
+	 * config and IBUF to OUR scanout buffer and issued the first
+	 * fetch - but that fetch is still in flight when this function
+	 * returns (~16 ms transfer), and writing AUTOREFRESH_CONFIG_P
+	 * mid-cycle is the exact hazard that killed the m2k/m2l boots.
+	 * So the takeover happens one commit later: on the SECOND flush
+	 * the first frame has certainly completed, the pipe state is
+	 * fully ours, and we apply the w1a_autorefresh policy (default:
+	 * keep lk2nd's 60Hz armed - it is what has been delivering
+	 * frames all along; see the m4b comment at the param). */
+	if (!mdp3_kms->autorefresh_taken && ++mdp3_kms->commit_count == 2) {
+		u32 reg = w1a_autorefresh ? (BIT(28) | w1a_autorefresh) : 0;
+		u32 was = mdp3_read(mdp3_kms, REG_MDP3_AUTOREFRESH_CONFIG_P);
+
+		mdp3_kms->autorefresh_taken = true;
+		if (was != reg)
+			mdp3_write(mdp3_kms, REG_MDP3_AUTOREFRESH_CONFIG_P, reg);
+		pr_info("MDP3DBG m4b: autorefresh takeover at 2nd commit: interval=%u reg %08x -> %08x\n",
+			w1a_autorefresh, was, reg);
+	}
 }
 
 static void mdp3_complete_commit(struct msm_kms *kms, unsigned crtc_mask)
