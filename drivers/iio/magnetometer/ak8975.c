@@ -80,6 +80,7 @@
 #define AK09912_REG_WIA2		0x01
 #define AK09918_DEVICE_ID		0x0C
 #define AK09916_DEVICE_ID		0x09
+#define AK09915_DEVICE_ID		0x10
 #define AK09912_DEVICE_ID		0x04
 #define AK09911_DEVICE_ID		0x05
 
@@ -210,6 +211,7 @@ enum asahi_compass_chipset {
 	AK09911,
 	AK09912,
 	AK09916,
+	AK09915,
 	AK09918,
 };
 
@@ -374,6 +376,35 @@ static const struct ak_def ak_def_array[] = {
 			AK09912_REG_HYL,
 			AK09912_REG_HZL},
 	},
+	[AK09915] = {
+		/*
+		 * AK09915 (CMCC W1A): same register map and scale as
+		 * AK09916, distinct WIA2 (0x10).
+		 */
+		.type = AK09915,
+		.raw_to_gauss = ak09912_raw_to_gauss,
+		.range = 32752,
+		.ctrl_regs = {
+			AK09912_REG_ST1,
+			AK09912_REG_ST2,
+			AK09912_REG_CNTL2,
+			AK09912_REG_ASAX,
+			AK09912_MAX_REGS},
+		.ctrl_masks = {
+			AK09912_REG_ST1_DRDY_MASK,
+			AK09912_REG_ST2_HOFL_MASK,
+			0,
+			AK09912_REG_CNTL2_MODE_MASK},
+		.ctrl_modes = {
+			AK09912_REG_CNTL_MODE_POWER_DOWN,
+			AK09912_REG_CNTL_MODE_ONCE,
+			AK09912_REG_CNTL_MODE_SELF_TEST,
+			AK09912_REG_CNTL_MODE_FUSE_ROM},
+		.data_regs = {
+			AK09912_REG_HXL,
+			AK09912_REG_HYL,
+			AK09912_REG_HZL},
+	},
 	[AK09918] = {
 		/* ak09918 is register compatible with ak09912 this is for avoid
 		 * unknown id messages.
@@ -513,6 +544,10 @@ static int ak8975_who_i_am(struct i2c_client *client,
 		break;
 	case AK09916:
 		if (wia_val[1] == AK09916_DEVICE_ID)
+			return 0;
+		break;
+	case AK09915:
+		if (wia_val[1] == AK09915_DEVICE_ID)
 			return 0;
 		break;
 	case AK09918:
@@ -1105,6 +1140,7 @@ static const struct i2c_device_id ak8975_id[] = {
 	{"ak09911", (kernel_ulong_t)&ak_def_array[AK09911] },
 	{"ak09912", (kernel_ulong_t)&ak_def_array[AK09912] },
 	{"ak09916", (kernel_ulong_t)&ak_def_array[AK09916] },
+	{"ak09915", (kernel_ulong_t)&ak_def_array[AK09915] },
 	{"ak09918", (kernel_ulong_t)&ak_def_array[AK09918] },
 	{ }
 };
@@ -1120,6 +1156,7 @@ static const struct of_device_id ak8975_of_match[] = {
 	{ .compatible = "asahi-kasei,ak09912", .data = &ak_def_array[AK09912] },
 	{ .compatible = "ak09912", .data = &ak_def_array[AK09912] },
 	{ .compatible = "asahi-kasei,ak09916", .data = &ak_def_array[AK09916] },
+	{ .compatible = "asahi-kasei,ak09915", .data = &ak_def_array[AK09915] },
 	{ .compatible = "asahi-kasei,ak09918", .data = &ak_def_array[AK09918] },
 	{ }
 };
