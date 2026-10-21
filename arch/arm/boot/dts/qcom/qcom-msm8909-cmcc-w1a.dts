@@ -242,10 +242,18 @@
 	};
 };
 
+/*
+ * The PMIC BMS is disabled: the watch's real fuel gauge is the CW2015
+ * on QUP4 (stock design), while the PMIC coulomb counter needs a
+ * calibrated battery OCV table that we do not have yet.  With both
+ * enabled the two gauges disagree (4.42 V/Charging vs the CW2015's
+ * 4.28 V/Full), which would confuse userspace battery reporting.
+ * Re-enable once the battery characterization TODO above is done.
+ */
 &pm8909_bms {
 	monitored-battery = <&bat>;
 	power-supplies = <&pm8909_charger>;
-	status = "okay";
+	status = "disabled";
 };
 
 &pm8909_charger {
