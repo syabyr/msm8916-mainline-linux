@@ -22,8 +22,10 @@
 #include "qcom-msm8909-pm8909.dtsi"
 
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/clock/qcom,dsi-phy-28nm.h>
+#include <dt-bindings/sound/apq8016-lpass.h>
 
 / {
 	model = "CMCC W1A";
@@ -78,11 +80,68 @@
 			<3620000 4>, <3555000 3>, <3461000 2>, <3312000 1>,
 			<3000000 0>;
 	};
+
+	/*
+	 * The watch has exactly TWO buttons: power (PMIC PON kpdpwr, see
+	 * qcom-pm8909.dtsi) and volume.  The volume button is on TLMM
+	 * gpio90 - confirmed live: pressing it emits KEY_VOLUMEUP (115).
+	 * The stock DTB's other two gpio_keys entries (gpio91/92,
+	 * camera_focus/camera_snapshot) are reference-design leftovers
+	 * with no physical button behind them, so they are not modeled.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&gpio_key_active>;
+		pinctrl-1 = <&gpio_key_suspend>;
+
+		key-volup {
+			label = "volume_up";
+			gpios = <&tlmm 90 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			gpio-key,wakeup;
+			debounce-interval = <15>;
+		};
+	};
 };
+
+/*
+ * All six BLSP1 QUP I2C buses are enabled for peripheral discovery.
+ * The stock DTB only populates QUP2 (camera @0x01 + NFC nq@0x28),
+ * QUP4 (cw2015 fuel gauge @0x62) and QUP5 (touch); the others are
+ * scanned at runtime with i2cdetect to find out what this unit has.
+ *
+ * Live scans found the motion/environment sensors on QUP1 - the vendor
+ * design routes that controller to the SSC/ADSP, which is why the
+ * stock AP device tree has no nodes for them.  In mainline the ADSP is
+ * not running, so the AP drives that bus directly:
+ *   0x0c AK09915 magnetometer (WIA1 0x48 / WIA2 0x10)
+ *   0x76 BMP280 barometer   (chip id 0x58)
+ * The 0x15 device on the same bus is not identified yet; the
+ * accelerometer/gyro was not found on any AP bus (likely power-gated
+ * by the SSC).
+ */
+&blsp_i2c1 {
+	status = "okay";
+
+	magnetometer@c {
+		compatible = "asahi-kasei,ak09915";
+		reg = <0x0c>;
+	};
+
+	barometer@76 {
+		compatible = "bosch,bmp280";
+		reg = <0x76>;
+	};
+};
+&blsp_i2c2 { status = "okay"; };
+&blsp_i2c3 { status = "okay"; };
+&blsp_i2c4 { status = "okay"; };
+&blsp_i2c6 { status = "okay"; };
 
 /* FocalTech FT3267 touch: downstream irq gpio13 active, reset gpio12,
  * vdd/vcc_i2c = 8916_l6 (1.8V fixed), avdd = 8916_l17 (2.85V always-on).
- * No mainline driver yet; node is inert until the port lands.
+ * Driver: drivers/input/touchscreen/focaltech_ft3267.c
  */
 &blsp_i2c5 {
 	status = "okay";
@@ -110,6 +169,64 @@
 
 &blsp_uart1 {
 	status = "okay";
+};
+
+/*
+ * Audio: PM8909 WCD analog codec (SPMI SID 0) + LPASS digital codec,
+ * connected over the internal CDC path (LPASS <-> PMIC).  The CDC PDM
+ * lines are TLMM gpio59..64, muxed as cdc_pdm0 - values taken from the
+ * stock DTB (cdc-pdm-lines).  Speaker is the PMIC's class-D SPK path,
+ * microphone AMIC1.
+ */
+&lpass {
+	status = "okay";
+};
+
+&lpass_codec {
+	status = "okay";
+};
+
+&pm8909_codec {
+	status = "okay";
+};
+
+&sound {
+	status = "okay";
+	model = "cmcc-w1a";
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&cdc_pdm_default>;
+	pinctrl-1 = <&cdc_pdm_sleep>;
+	audio-routing =
+		"AMIC1", "MIC BIAS External1",
+		"AMIC2", "MIC BIAS Internal2",
+		"AMIC3", "MIC BIAS External1";
+
+	dai-link-primary {
+		link-name = "Primary MI2S";
+
+		cpu {
+			sound-dai = <&lpass MI2S_PRIMARY>;
+		};
+
+		codec {
+			sound-dai = <&lpass_codec 0>, <&pm8909_codec 0>;
+		};
+	};
+
+	/* Capture (microphone): Primary MI2S is playback-only in the
+	 * LPASS driver, capture lives on Tertiary MI2S (as on the
+	 * APQ8016 SBC reference). */
+	dai-link-tertiary {
+		link-name = "WCD-Capture";
+
+		cpu {
+			sound-dai = <&lpass MI2S_TERTIARY>;
+		};
+
+		codec {
+			sound-dai = <&lpass_codec 1>, <&pm8909_codec 1>;
+		};
+	};
 };
 
 &pm8909_bms {
@@ -583,5 +700,37 @@
 		function = "mdp_vsync";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	/* CDC PDM lines between LPASS and the PMIC analog codec
+	 * (stock cdc-pdm-lines): gpio59..64, cdc_pdm0, 8 mA driving. */
+	cdc_pdm_default: cdc-pdm-default-state {
+		pins = "gpio59", "gpio60", "gpio61", "gpio62", "gpio63", "gpio64";
+		function = "cdc_pdm0";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	cdc_pdm_sleep: cdc-pdm-sleep-state {
+		pins = "gpio59", "gpio60", "gpio61", "gpio62", "gpio63", "gpio64";
+		function = "cdc_pdm0";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	/* Volume button (gpio90; see the gpio-keys node): gpio function,
+	 * 2 mA, pull-up in both active and suspend states. */
+	gpio_key_active: gpio-key-active-state {
+		pins = "gpio90";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	gpio_key_suspend: gpio-key-suspend-state {
+		pins = "gpio90";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
 	};
 };
