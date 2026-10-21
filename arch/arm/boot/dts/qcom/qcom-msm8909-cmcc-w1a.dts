@@ -136,7 +136,20 @@
 };
 &blsp_i2c2 { status = "okay"; };
 &blsp_i2c3 { status = "okay"; };
-&blsp_i2c4 { status = "okay"; };
+&blsp_i2c4 {
+	status = "okay";
+
+	/* CellWise CW2015 shuntless fuel gauge (stock DTB cw2015@0x62,
+	 * live scan ACK at 0x62 on QUP4).  No battery-profile blob is
+	 * shipped; the driver falls back to the gauge's flash profile. */
+	fuel-gauge@62 {
+		compatible = "cellwise,cw2015";
+		reg = <0x62>;
+		monitored-battery = <&bat>;
+		power-supplies = <&pm8909_charger>;
+		cellwise,monitor-interval-ms = <1000>;
+	};
+};
 &blsp_i2c6 { status = "okay"; };
 
 /* FocalTech FT3267 touch: downstream irq gpio13 active, reset gpio12,
