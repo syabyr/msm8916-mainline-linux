@@ -106,20 +106,17 @@
 };
 
 /*
- * All six BLSP1 QUP I2C buses are enabled for peripheral discovery.
- * The stock DTB only populates QUP2 (camera @0x01 + NFC nq@0x28),
- * QUP4 (cw2015 fuel gauge @0x62) and QUP5 (touch); the others are
- * scanned at runtime with i2cdetect to find out what this unit has.
- *
- * Live scans found the motion/environment sensors on QUP1 - the vendor
- * design routes that controller to the SSC/ADSP, which is why the
- * stock AP device tree has no nodes for them.  In mainline the ADSP is
- * not running, so the AP drives that bus directly:
+ * BLSP1 QUP buses.  QUP1 carries the motion/environment sensors (the
+ * vendor routes it to the SSC/ADSP, which is why the stock AP tree has
+ * no nodes for them; in mainline the ADSP is not running so the AP
+ * drives them directly):
  *   0x0c AK09915 magnetometer (WIA1 0x48 / WIA2 0x10)
- *   0x76 BMP280 barometer   (chip id 0x58)
- * The 0x15 device on the same bus is not identified yet; the
- * accelerometer/gyro was not found on any AP bus (likely power-gated
- * by the SSC).
+ *   0x76 BMP280 barometer    (chip id 0x58)
+ *   0x15 PixArt PAH8011 heart rate (stock registry sensor_def_qcomdev.conf)
+ * The accelerometer/gyro (LSM6DS3) is not I2C: the stock sensor registry
+ * puts it on SPI instance 3 (SPI_bus 0x1003), IRQ on TLMM gpio96 - see
+ * the blsp_spi3 node below.  QUP6 stays disabled (probing the stock
+ * DTB's spi@78ba000 as SPI returned an unrecognised whoami 0x80).
  */
 &blsp_i2c1 {
 	status = "okay";
@@ -150,7 +147,30 @@
 		cellwise,monitor-interval-ms = <1000>;
 	};
 };
-&blsp_i2c6 { status = "okay"; };
+/*
+ * LSM6DS3 accelerometer/gyro: the stock sensor registry puts it on
+ * SPI bus instance 3 (SPI_bus 0x1003; the i2c_bus numbers in the same
+ * file match the QUP numbering we verified live - bus 1 = QUP1).
+ * QUP3 = 0x78b7000, pins gpio0..3, IRQ on TLMM gpio96.
+ */
+&blsp_spi3 {
+	status = "okay";
+
+	accel@0 {
+		compatible = "st,lsm6ds3";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+
+		vdd-supply = <&pm8909_l17>;	/* 2.85 V */
+		vddio-supply = <&pm8909_l6>;	/* 1.8 V */
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <96 IRQ_TYPE_EDGE_RISING>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&sensor_irq_default>;
+	};
+};
 
 /* FocalTech FT3267 touch: downstream irq gpio13 active, reset gpio12,
  * vdd/vcc_i2c = 8916_l6 (1.8V fixed), avdd = 8916_l17 (2.85V always-on).
@@ -209,10 +229,11 @@
 	pinctrl-names = "default", "sleep";
 	pinctrl-0 = <&cdc_pdm_default>;
 	pinctrl-1 = <&cdc_pdm_sleep>;
+	/* The watch has a single analog microphone on AMIC1 with an
+	 * external mic bias (stock DTB: Handset Mic -> MIC BIAS External).
+	 * Verified by capture: ADC1 carries signal, ADC2/ADC3 are silent. */
 	audio-routing =
-		"AMIC1", "MIC BIAS External1",
-		"AMIC2", "MIC BIAS Internal2",
-		"AMIC3", "MIC BIAS External1";
+		"AMIC1", "MIC BIAS External1";
 
 	dai-link-primary {
 		link-name = "Primary MI2S";
@@ -721,6 +742,15 @@
 		function = "mdp_vsync";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	/* LSM6DS3 interrupt (INT1) on TLMM gpio96: plain GPIO input,
+	 * stock sensor registry "gpio1 96" for the accel/gyro. */
+	sensor_irq_default: sensor-irq-default-state {
+		pins = "gpio96";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
 	};
 
 	/* CDC PDM lines between LPASS and the PMIC analog codec
