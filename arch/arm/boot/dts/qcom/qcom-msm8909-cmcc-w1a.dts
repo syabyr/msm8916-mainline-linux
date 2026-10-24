@@ -324,6 +324,20 @@
 };
 
 /*
+ * Modem (MSS) for GPS: the QMI LOC service runs on the modem DSP.
+ * Firmware is on the modem partition (vfat p1, image/ dir); w1a-init.sh
+ * mounts it read-only and symlinks the firmware files into
+ * /lib/firmware before the remoteproc rebind (the kernel's default
+ * firmware search path finds them there).
+ *
+ * GPS stack: qrtr-smd (IPCRTR channel on the hexagon smd-edge) +
+ * libqmi/gpsd in userspace - see docs/backlog.md section four.
+ */
+&mpss {
+	status = "okay";
+};
+
+/*
  * Display bring-up (B-full step 1: DSI host + PHY + panel).
  *
  * MDP3 (display-controller@1a00000) has no mainline driver yet; it stays
