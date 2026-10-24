@@ -277,16 +277,6 @@
 	status = "disabled";
 };
 
-/*
- * RTC: allow hwclock -w to write the PMIC RTC directly.  Without this
- * property the pm8xxx driver refuses RTC_SET_TIME (-ENODEV) unless an
- * offset nvmem cell / UEFI variable exists (we have neither), so the
- * clock could never be calibrated after NTP.
- */
-&pm8909_rtc {
-	allow-set-time;
-};
-
 &pm8909_charger {
 	qcom,fast-charge-safe-current = <630000>;
 	qcom,fast-charge-safe-voltage = <4300000>;
