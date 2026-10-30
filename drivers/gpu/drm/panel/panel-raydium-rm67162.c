@@ -40,6 +40,11 @@ struct rm67162_panel {
 
 	struct regulator_bulk_data supplies[2];
 
+	/* last brightness requested through the backlight device; replayed
+	 * by the init sequence because prepare() resets the panel and the
+	 * power-on default is full brightness */
+	unsigned int brightness;
+
 	bool prepared;
 };
 
@@ -75,8 +80,9 @@ static int rm67162_write(struct mipi_dsi_device *dsi, u8 cmd, u8 value)
 	return mipi_dsi_generic_write(dsi, buf, sizeof(buf));
 }
 
-static int rm67162_push_cmd_list(struct mipi_dsi_device *dsi)
+static int rm67162_push_cmd_list(struct rm67162_panel *ctx)
 {
+	struct mipi_dsi_device *dsi = ctx->dsi;
 	int ret;
 
 	/* select page 0x0a */
@@ -99,7 +105,13 @@ static int rm67162_push_cmd_list(struct mipi_dsi_device *dsi)
 	ret = rm67162_write(dsi, WRMAUCCTR, 0x00);
 	if (ret < 0)
 		return ret;
-	ret = rm67162_write(dsi, 0x51, 0xff);
+	/*
+	 * Replay the brightness the user last asked for instead of the
+	 * panel's full-brightness default: prepare() resets the panel on
+	 * every unblank, so hardcoding 0xff here made the display come back
+	 * at maximum brightness after blank/unblank.
+	 */
+	ret = rm67162_write(dsi, 0x51, ctx->brightness);
 	if (ret < 0)
 		return ret;
 	ret = rm67162_write(dsi, 0x53, 0x20);
@@ -165,7 +177,21 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 	dev_info(dev, "MDP3DBG panel enable: sending init seq\n");
 	w1a_mb("panel enable: init seq next");
 
-	ret = rm67162_push_cmd_list(dsi);
+	/*
+	 * W1A (v21): sacrificial first transfer.  The forensic step trace
+	 * (v20) shows the FIRST command after the full re-enable path
+	 * fetches while the byte clock domain is still settling: HS FIFO
+	 * underflow + DSICLK domain glitch on exactly that transfer, all
+	 * subsequent transfers healthy.  That first transfer was the 0xFE
+	 * page select - failing it aborted the whole init sequence (black
+	 * screen after DPMS wake).  Send a harmless page-0 select first
+	 * and ignore its result; the real init sequence then starts on a
+	 * warmed-up engine.
+	 */
+	rm67162_write(dsi, WRMAUCCTR, 0x00);
+	msleep(20);
+
+	ret = rm67162_push_cmd_list(ctx);
 	if (ret < 0) {
 		dev_err(dev, "Failed to send vendor commands (%d)\n", ret);
 		return ret;
@@ -210,21 +236,44 @@ static int rm67162_panel_disable(struct drm_panel *panel)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
+	/*
+	 * W1A (v22): sacrificial first transfer on the DISABLE path too -
+	 * symmetric with enable().  The v21 forensics showed the disable
+	 * sequence's own commands hit the same unsettled-clock window
+	 * (last pre-trigger of the R2 blank: st0=5, HS underflow,
+	 * clkst=0x37cf), and when one wedges the engine the NEXT enable's
+	 * sacrificial write cannot recover it (st0=3 stuck) - R2/R3 wakes
+	 * failed.  Warm the engine before the real OFF commands.
+	 */
+	rm67162_write(dsi, WRMAUCCTR, 0x00);
+	msleep(20);
+
 	ret = mipi_dsi_dcs_set_display_off(dsi);
 	if (ret < 0) {
-		dev_err(dev, "Failed to set display OFF (%d)\n", ret);
-		return ret;
+		/*
+		 * W1A (v17): report success even when the DCS write timed
+		 * out.  drm_panel_disable() only clears panel->enabled when
+		 * funcs->disable returns 0; failing here strands the flag
+		 * and the next enable is skipped ("Skipping enable of
+		 * already enabled panel") - the panel never gets its init
+		 * sequence after DPMS-off/on and stays black.  The display
+		 * is being torn down either way; a lost OFF command costs
+		 * nothing but a powered-on panel for the blank period.
+		 */
+		dev_err(dev, "set_display_off failed (%d) - continuing\n", ret);
 	}
 
 	ret = mipi_dsi_dcs_enter_sleep_mode(dsi);
-	if (ret < 0) {
-		dev_err(dev, "Failed to enter sleep mode (%d)\n", ret);
-		return ret;
-	}
+	if (ret < 0)
+		dev_err(dev, "enter_sleep failed (%d) - continuing\n", ret);
 
 	msleep(120);
 
-	return rm67162_write(dsi, 0x4f, 0x01);
+	ret = rm67162_write(dsi, 0x4f, 0x01);
+	if (ret < 0)
+		dev_err(dev, "0x4f write failed (%d) - continuing\n", ret);
+
+	return 0;
 }
 
 static int rm67162_panel_get_modes(struct drm_panel *panel,
@@ -256,12 +305,14 @@ static int rm67162_bl_update_status(struct backlight_device *bl)
 	struct rm67162_panel *ctx = mipi_dsi_get_drvdata(dsi);
 	int ret = 0;
 
+	ctx->brightness = bl->props.brightness;
+
 	if (!ctx->prepared)
 		return 0;
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	ret = rm67162_write(dsi, 0x51, bl->props.brightness);
+	ret = rm67162_write(dsi, 0x51, ctx->brightness);
 	if (ret < 0)
 		return ret;
 
@@ -337,6 +388,7 @@ static int rm67162_panel_probe(struct mipi_dsi_device *dsi)
 	bl_props.type = BACKLIGHT_RAW;
 	bl_props.brightness = 255;
 	bl_props.max_brightness = 255;
+	ctx->brightness = bl_props.brightness;
 
 	ctx->panel.backlight = devm_backlight_device_register(
 					dev, dev_name(dev), dev, dsi,

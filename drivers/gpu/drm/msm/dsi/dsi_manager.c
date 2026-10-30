@@ -6,6 +6,18 @@
 #include <linux/printk.h>
 extern void w1a_mb(const char *fmt, ...); /* W1A mailbox */
 extern bool w1a_dsi_inherit; /* dsi_host.c: keep lk2nd handoff state (m2r) */
+extern bool w1a_dsi_boot_inherit; /* dsi_host.c: v10 hybrid - first power_on only */
+
+/*
+ * v10 hybrid: the boot-inherit power_on skips msm_dsi_phy_enable(), so
+ * the matching post_disable must skip msm_dsi_phy_disable() - otherwise
+ * regulator/pm_runtime refcounts underflow ("unbalanced disables for
+ * l6", "Runtime PM usage count underflow").  Once a power_on has run
+ * the full phy-enable path, the flag is false and disables pair up
+ * normally.  (Definition sits below dsi_mgr_phy_disable.)
+ */
+static bool w1a_phy_skipped;
+static void w1a_maybe_phy_disable(int id);
 
 #include "drm/drm_bridge_connector.h"
 
@@ -199,6 +211,17 @@ static void dsi_mgr_phy_disable(int id)
 	}
 }
 
+/* v10 hybrid: skip the disable that pairs with a skipped enable (see
+ * the comment at the w1a_phy_skipped declaration). */
+static void w1a_maybe_phy_disable(int id)
+{
+	if (w1a_phy_skipped) {
+		w1a_phy_skipped = false;
+		return;
+	}
+	dsi_mgr_phy_disable(id);
+}
+
 struct dsi_bridge {
 	struct drm_bridge base;
 	int id;
@@ -224,17 +247,20 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 
 	DBG("id=%d", id);
 
-	if (w1a_dsi_inherit) {
+	if (w1a_dsi_inherit && w1a_dsi_boot_inherit) {
 		/* m2r: do not touch the PHY/PLL - lk2nd left lanes timed
 		 * and the PLL locked; re-running the 28nm phy power-on is
 		 * one of the suspects for the wedged command fetch.  The
 		 * shared timings stay zeroed, which only feeds timing
-		 * calculations that the inherit host path skips anyway. */
+		 * calculations that the inherit host path skips anyway.
+		 * v10: BOOT ONLY (see w1a_dsi_boot_inherit). */
 		memset(phy_shared_timings, 0, sizeof(phy_shared_timings));
+		w1a_phy_skipped = true;
 		dev_info(&msm_dsi->pdev->dev,
-			 "MDP3DBG dsi phy_enable SKIPPED (inherit mode)\n");
-		w1a_mb("dsi phy skipped (inherit)");
+			 "MDP3DBG dsi phy_enable SKIPPED (boot inherit)\n");
+		w1a_mb("dsi phy skipped (boot inherit)");
 	} else {
+		w1a_phy_skipped = false;
 		ret = dsi_mgr_phy_enable(id, phy_shared_timings);
 		if (ret)
 			goto phy_en_fail;
@@ -274,7 +300,7 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 host1_on_fail:
 	msm_dsi_host_power_off(host);
 host_on_fail:
-	dsi_mgr_phy_disable(id);
+	w1a_maybe_phy_disable(id);
 phy_en_fail:
 	return ret;
 }
@@ -422,7 +448,7 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	}
 
 disable_phy:
-	dsi_mgr_phy_disable(id);
+	w1a_maybe_phy_disable(id);
 }
 
 static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,

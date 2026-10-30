@@ -161,15 +161,28 @@ static void w1a_mb_init(void)
 	/* +200K sits in the dump-record area (records only written by
 	 * pstore on panic, record 0 first) - never touched while alive.
 	 * m2t: memremap, not ioremap - the ramoops region is RAM and
-	 * arm32 ioremap refuses RAM pages (mailbox was dead in m2s). */
+	 * arm32 ioremap refuses RAM pages (mailbox was dead in m2s).
+	 * v6: memremap ALSO fails on this arm32 build (the __arm_ioremap
+	 * path refuses RAM pfns and returns NULL after a WARN) - the
+	 * region is "map non-reusable", i.e. it IS in the kernel linear
+	 * mapping, so fall back to __va() which needs no mapping at all.
+	 * Without a working mailbox, a console_lock-stuck commit path is
+	 * invisible in ramoops (v5). */
 	w1a_mb_mem = memremap(base + 200 * 1024, 4096, MEMREMAP_WC);
-	pr_info("MDP3DBG mb: ramoops %pa, mailbox at +200K\n", &base);
+	if (!w1a_mb_mem)
+		w1a_mb_mem = __va(base + 200 * 1024);
+	pr_info("MDP3DBG mb: ramoops %pa, mailbox at +200K (%s)\n", &base,
+		w1a_mb_mem ? "live" : "DEAD");
 	pr_flush(1000, true);
 	return;
 none:
 	pr_info("MDP3DBG mb: no ramoops node, mailbox disabled\n");
 	pr_flush(1000, true);
 }
+
+/* W1A (v36): set by the dsi host when the tx buffer moved to the raw-PA
+ * path; gates the SMMU re-attach + identity map below */
+extern bool w1a_dsi_pa_active;
 
 /* safe from any context, incl. atomic and while console_lock is held */
 __printf(1, 2)
@@ -256,6 +269,32 @@ static void w1a_watchdog_start(void)
 	smp_call_function_single(cpu, w1a_arm_watchdog, NULL, true);
 	pr_info("MDP3DBG watchdog started (hb 500ms on boot cpu, stall panic after 4s on cpu%u)\n", cpu);
 	pr_flush(1000, true);
+}
+
+/* v4 forensics: one-shot re-dump 5 s after modeset init - by then the
+ * 2nd commit has taken autorefresh over and the pipe has been pushing
+ * frames for a while; INTR_STATUS/AUTOREFRESH/PLL state here tells
+ * whether the refresh engine is actually cycling (vs armed-but-dead). */
+static void w1a_t5s_fn(struct work_struct *work)
+{
+	struct mdp3_kms *mdp3_kms = w1a_kms;
+
+	if (!mdp3_kms)
+		return;
+	pr_info("MDP3DBG t5s: intr_en=%08x intr_st=%08x autorefresh=%08x dma_start=%08x\n",
+		mdp3_read(mdp3_kms, REG_MDP3_INTR_ENABLE),
+		mdp3_read(mdp3_kms, REG_MDP3_INTR_STATUS),
+		mdp3_read(mdp3_kms, REG_MDP3_AUTOREFRESH_CONFIG_P),
+		mdp3_read(mdp3_kms, REG_MDP3_DMA_P_START));
+	mdp3_dsi_raw_dump(mdp3_kms, "t5s");
+	pr_flush(1000, true);
+}
+static struct delayed_work w1a_t5s_work;
+
+static void w1a_t5s_start(void)
+{
+	INIT_DELAYED_WORK(&w1a_t5s_work, w1a_t5s_fn);
+	schedule_delayed_work(&w1a_t5s_work, msecs_to_jiffies(5000));
 }
 
 static int mdp3_hw_init(struct msm_kms *kms)
@@ -382,6 +421,117 @@ void mdp3_kms_dump(struct mdp3_kms *mdp3_kms, const char *tag)
 	pm_runtime_put_sync(mdp3_kms->dev->dev);
 }
 
+/* W1A bring-up: full DSI controller register dump (raw bank offsets,
+ * base 0x1ac8000 = DSI xml offset + 4) - the same register set both
+ * times so the "lk2nd" (handoff) and "live" (first kick, after our
+ * programming) captures can be diffed line by line. */
+void mdp3_dsi_raw_dump(struct mdp3_kms *mdp3_kms, const char *tag)
+{
+	void __iomem *d = mdp3_kms->dsi_ctrl;
+
+	if (!d)
+		return;
+
+	pr_info("MDP3DBG %s dsi A: ctrl=%08x st0=%08x fifo=%08x dma_ctrl=%08x cfg0=%08x cfg1=%08x\n",
+		tag,
+		readl(d + 0x004), readl(d + 0x008), readl(d + 0x00c),
+		readl(d + 0x03c), readl(d + 0x040), readl(d + 0x044));
+	pr_info("MDP3DBG %s dsi B: base=%08x len=%08x wm50=%08x str0ctl=%08x str0tot=%08x str1ctl=%08x str1tot=%08x\n",
+		tag,
+		readl(d + 0x048), readl(d + 0x04c), readl(d + 0x050),
+		readl(d + 0x058), readl(d + 0x05c),
+		readl(d + 0x060), readl(d + 0x064));
+	pr_info("MDP3DBG %s dsi C: ackerr=%08x trig=%08x lanest=%08x lanectl=%08x swap=%08x phyerr=%08x\n",
+		tag,
+		readl(d + 0x068), readl(d + 0x084), readl(d + 0x0a8),
+		readl(d + 0x0ac), readl(d + 0x0b0), readl(d + 0x0b4));
+	pr_info("MDP3DBG %s dsi D: lptim=%08x hstim=%08x tmo=%08x clkout=%08x eot=%08x\n",
+		tag,
+		readl(d + 0x0b8), readl(d + 0x0bc), readl(d + 0x0c0),
+		readl(d + 0x0c4), readl(d + 0x0cc));
+	pr_info("MDP3DBG %s dsi E: errmask=%08x intctl=%08x reset=%08x clkctl=%08x clkst=%08x phyrst=%08x\n",
+		tag,
+		readl(d + 0x10c), readl(d + 0x110), readl(d + 0x118),
+		readl(d + 0x11c), readl(d + 0x120), readl(d + 0x12c));
+	pr_info("MDP3DBG %s dsi F: preext=%08x mdpctl2=%08x str2ctl=%08x ver=%08x\n",
+		tag,
+		readl(d + 0x180), readl(d + 0x1b8), readl(d + 0x1bc),
+		readl(d + 0x1f4));
+	/* MDP3 QoS remapper + panic regs (bank 0x1a90000): lk2nd's
+	 * msm8909 target programs 0x1A9 into 0x1a90090 unconditionally
+	 * (platform/msm8909/include/platform/iomap.h); mainline never
+	 * touches it.  Power-on default vs 0x1A9 is a data point for
+	 * whether the fetch QoS matters. */
+	pr_info("MDP3DBG %s mdp3 qos: remapper=%08x wm0=%08x wm1=%08x wm2=%08x panic=%08x lut0=%08x\n",
+		tag,
+		mdp3_read(mdp3_kms, 0x90090),
+		mdp3_read(mdp3_kms, 0x90094),
+		mdp3_read(mdp3_kms, 0x90098),
+		mdp3_read(mdp3_kms, 0x9009c),
+		mdp3_read(mdp3_kms, 0x900a0),
+		mdp3_read(mdp3_kms, 0x900a4));
+
+	/* v4: DSI PHY analog state (raw offsets from 0x1ac8500, from
+	 * dsi_phy_28nm.xml) - the vendor-enable path rewrites all of
+	 * these; lk2nd's handoff values are the reference.  CTRL_0/4,
+	 * STRENGTH_0/1, GLBL_TEST_CTRL, LDO_CNTRL, 12 DPHY TIMING_CTRL. */
+	if (mdp3_kms->dsi_phy) {
+		void __iomem *p = mdp3_kms->dsi_phy;
+		int i;
+
+		pr_info("MDP3DBG %s phy P1: ctrl0=%08x ctrl4=%08x str0=%08x str1=%08x glbl=%08x ldo=%08x\n",
+			tag,
+			readl(p + 0x170), readl(p + 0x180),
+			readl(p + 0x184), readl(p + 0x188),
+			readl(p + 0x1d4), readl(p + 0x1dc));
+		for (i = 0; i < 12; i += 6)
+			pr_info("MDP3DBG %s phy T%d: tim[%d..%d] = %08x %08x %08x %08x %08x %08x\n",
+				tag, i / 6, i, i + 5,
+				readl(p + 0x140 + 4 * i),
+				readl(p + 0x140 + 4 * (i + 1)),
+				readl(p + 0x140 + 4 * (i + 2)),
+				readl(p + 0x140 + 4 * (i + 3)),
+				readl(p + 0x140 + 4 * (i + 4)),
+				readl(p + 0x140 + 4 * (i + 5)));
+	}
+
+	/* v4: DSI PLL state (raw offsets from 0x1ac8300) - GLB_CFG powers
+	 * the PLL, STATUS bit0 = locked, SDM_CFG* are the rate seed regs
+	 * that set_rate rewrites over a running PLL. */
+	if (mdp3_kms->dsi_pll) {
+		void __iomem *l = mdp3_kms->dsi_pll;
+
+		pr_info("MDP3DBG %s pll: glb=%08x status=%08x refclk=%08x postdiv3=%08x sdm0=%08x sdm1=%08x sdm2=%08x sdm3=%08x sdm4=%08x\n",
+			tag,
+			readl(l + 0x20), readl(l + 0xc0),
+			readl(l + 0x00), readl(l + 0x28),
+			readl(l + 0x38), readl(l + 0x3c),
+			readl(l + 0x40), readl(l + 0x44),
+			readl(l + 0x48));
+	}
+
+	/* v4: the link clock RCGs inside GCC (base 0x1800000).  byte0
+	 * CMD_RCGR @0x4d044 / pclk0 @0x4d000: CFG0 low bits = parent mux
+	 * (byte0: 0=XO 1=DSI0PLL_BYTE; pclk0: 0=XO 1=DSI0PLL), plus the
+	 * branch enables (axi 0x4d080, vsync 0x4d090, byte0 0x4d094). */
+	if (mdp3_kms->gcc_base) {
+		void __iomem *g = mdp3_kms->gcc_base;
+
+		pr_info("MDP3DBG %s rcg: byte0_cmd=%08x byte0_cfg0=%08x byte0_cfg1=%08x pclk0_cmd=%08x pclk0_cfg0=%08x pclk0_cfg1=%08x\n",
+			tag,
+			readl(g + 0x4d044), readl(g + 0x4d048),
+			readl(g + 0x4d04c),
+			readl(g + 0x4d000), readl(g + 0x4d004),
+			readl(g + 0x4d008));
+		pr_info("MDP3DBG %s rcg branches: axi=%08x vsync=%08x byte0=%08x pclk0=%08x esc0=%08x\n",
+			tag,
+			readl(g + 0x4d080), readl(g + 0x4d090),
+			readl(g + 0x4d094), readl(g + 0x4d09c),
+			readl(g + 0x4d098));
+	}
+}
+EXPORT_SYMBOL(mdp3_dsi_raw_dump);
+
 static irqreturn_t mdp3_irq(struct msm_kms *kms)
 {
 	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
@@ -475,7 +625,35 @@ static void mdp3_enable_commit(struct msm_kms *kms)
 {
 	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
 
+	/* v6: mailbox marker - the first commit runs under console_lock
+	 * (fbcon takeover), so printk may never flush it */
+	w1a_mb("enable_commit (pm get)");
 	pm_runtime_get_sync(mdp3_kms->dev->dev);
+
+	/*
+	 * W1A (v32): after a display power cycle the SMMU context may be
+	 * powered down (qcom_iommu runtime PM through the device link) -
+	 * MDSS fetches then hang in translation with no fault latched
+	 * (every v11-v31 wake failure).  The 3.18 stock driver
+	 * attach/detaches the domain around every command batch; do the
+	 * equivalent here: re-attach before the commit that follows a
+	 * re-enable.  Cheap no-op when the domain is already live.
+	 */
+	if (w1a_dsi_pa_active && kms->vm) {
+		struct msm_mmu *mmu = to_msm_vm(kms->vm)->mmu;
+
+		msm_iommu_reattach(mmu);
+		/*
+		 * v35: identity-map the raw-PA DSI command buffer page -
+		 * after the re-attach the port is in translated mode and
+		 * the fetch from 0x8f68f000 faulted (v34: CB4 fsr=40000202,
+		 * far=8f68f000).  Map it so raw-PA fetches translate.
+		 * v36: only on the raw-PA path - doing this at boot (GEM
+		 * path) hung the first commit (mailbox died at the
+		 * enable_commit marker).
+		 */
+		msm_iommu_map_page_ident(mmu, 0x08f68f000, SZ_4K);
+	}
 }
 
 static void mdp3_disable_commit(struct msm_kms *kms)
@@ -502,6 +680,8 @@ static void mdp3_flush_commit(struct msm_kms *kms, unsigned crtc_mask)
 {
 	struct mdp3_kms *mdp3_kms = to_mdp3_kms(to_mdp_kms(kms));
 	struct drm_crtc *crtc;
+
+	w1a_mb("flush_commit (kicks next)");
 
 	/* the frame kick belongs here: at this point planes have been
 	 * programmed AND bridges enabled, so the DMA fetch has somewhere
@@ -679,48 +859,12 @@ static int mdp3_kms_init(struct drm_device *dev)
 	 * the reference for the DMA_P field encodings on this panel */
 	mdp3_kms_dump(mdp3_kms, "lk2nd state");
 
-	/* W1A bring-up m2q: dump the FULL DSI controller state exactly as
-	 * lk2nd left it (before the msm dsi driver touches anything).
-	 * lk2nd drives this RM67162 panel successfully, so whatever is in
-	 * these registers IS a known-good command-mode config; the -110
-	 * fail dump in dsi_host.c prints the same registers after OUR
-	 * setup, and the diff is the missing programming.  Raw bank
-	 * offsets (base 0x1ac8000) = DSI xml offset + 4. */
-	{
-		void __iomem *d = mdp3_kms->dsi_ctrl;
-
-		pr_info("MDP3DBG lk2nd dsi A: ctrl=%08x st0=%08x fifo=%08x dma_ctrl=%08x cfg0=%08x cfg1=%08x\n",
-			readl(d + 0x004), readl(d + 0x008), readl(d + 0x00c),
-			readl(d + 0x03c), readl(d + 0x040), readl(d + 0x044));
-		pr_info("MDP3DBG lk2nd dsi B: base=%08x len=%08x wm50=%08x str0ctl=%08x str0tot=%08x str1ctl=%08x str1tot=%08x\n",
-			readl(d + 0x048), readl(d + 0x04c), readl(d + 0x050),
-			readl(d + 0x058), readl(d + 0x05c),
-			readl(d + 0x060), readl(d + 0x064));
-		pr_info("MDP3DBG lk2nd dsi C: ackerr=%08x trig=%08x lanest=%08x lanectl=%08x swap=%08x phyerr=%08x\n",
-			readl(d + 0x068), readl(d + 0x084), readl(d + 0x0a8),
-			readl(d + 0x0ac), readl(d + 0x0b0), readl(d + 0x0b4));
-		pr_info("MDP3DBG lk2nd dsi D: lptim=%08x hstim=%08x tmo=%08x clkout=%08x eot=%08x\n",
-			readl(d + 0x0b8), readl(d + 0x0bc), readl(d + 0x0c0),
-			readl(d + 0x0c4), readl(d + 0x0cc));
-		pr_info("MDP3DBG lk2nd dsi E: errmask=%08x intctl=%08x reset=%08x clkctl=%08x clkst=%08x phyrst=%08x\n",
-			readl(d + 0x10c), readl(d + 0x110), readl(d + 0x118),
-			readl(d + 0x11c), readl(d + 0x120), readl(d + 0x12c));
-		pr_info("MDP3DBG lk2nd dsi F: preext=%08x mdpctl2=%08x str2ctl=%08x ver=%08x\n",
-			readl(d + 0x180), readl(d + 0x1b8), readl(d + 0x1bc),
-			readl(d + 0x1f4));
-		/* MDP3 QoS remapper + panic regs (bank 0x1a90000): lk2nd's
-		 * msm8909 target programs 0x1A9 into 0x1a90090 unconditionally
-		 * (platform/msm8909/include/platform/iomap.h); mainline never
-		 * touches it.  Power-on default vs 0x1A9 is a data point for
-		 * whether the fetch QoS matters. */
-		pr_info("MDP3DBG lk2nd mdp3 qos: remapper=%08x wm0=%08x wm1=%08x wm2=%08x panic=%08x lut0=%08x\n",
-			mdp3_read(mdp3_kms, 0x90090),
-			mdp3_read(mdp3_kms, 0x90094),
-			mdp3_read(mdp3_kms, 0x90098),
-			mdp3_read(mdp3_kms, 0x9009c),
-			mdp3_read(mdp3_kms, 0x900a0),
-			mdp3_read(mdp3_kms, 0x900a4));
-	}
+	/* W1A bring-up m2q: dump the FULL DSI controller state (raw bank
+	 * offsets, base 0x1ac8000 = DSI xml offset + 4) - the "lk2nd" call
+	 * here captures the known-good handoff state before the msm dsi
+	 * driver touches anything; mdp3_crtc re-invokes it with "live" at
+	 * the first kick to diff our programming against the handoff. */
+	mdp3_dsi_raw_dump(mdp3_kms, "lk2nd");
 
 	ret = modeset_init(mdp3_kms);
 	if (ret) {
@@ -733,6 +877,7 @@ static int mdp3_kms_init(struct drm_device *dev)
 	 * freeze gets dissected */
 	w1a_mb_init();
 	w1a_watchdog_start();
+	w1a_t5s_start();
 
 	return 0;
 
@@ -824,6 +969,16 @@ static int mdp3_probe(struct platform_device *pdev)
 	 * msm dsi host already owns; plain ioremap, no request_mem_region */
 	mdp3_kms->dsi_ctrl = devm_ioremap(dev, 0x01ac8000, SZ_4K);
 	if (!mdp3_kms->dsi_ctrl)
+		return -ENOMEM;
+
+	/* v4 forensics: read-only windows for the bring-up dumps - the PHY
+	 * (0x1ac8500), its PLL (0x1ac8300) and the GCC clock controller
+	 * (0x1800000, for the byte0/pclk0 RCG parent selection).  Owned by
+	 * their drivers; mapped without requesting, like dsi_ctrl. */
+	mdp3_kms->dsi_phy = devm_ioremap(dev, 0x01ac8500, SZ_4K);
+	mdp3_kms->dsi_pll = devm_ioremap(dev, 0x01ac8300, SZ_4K);
+	mdp3_kms->gcc_base = devm_ioremap(dev, 0x01800000, SZ_1M);
+	if (!mdp3_kms->dsi_phy || !mdp3_kms->dsi_pll || !mdp3_kms->gcc_base)
 		return -ENOMEM;
 
 	/*

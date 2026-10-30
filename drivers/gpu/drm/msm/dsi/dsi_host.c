@@ -78,6 +78,107 @@ static int __init w1a_clkhs_setup(char *s)
 }
 __setup("w1a.clkhs", w1a_clkhs_setup);
 
+/* W1A (noinherit): keep the ERROR interrupt group disabled.  The
+ * controller latches chronic "status" bits that the mainline ISR
+ * treats as errors and W1C writes cannot clear (FIFO_STATUS=0x11111000
+ * is the normal all-FIFOs-empty idle value on this hw; DLN0_PHY_ERR
+ * keeps sticky escape bits since lk2nd).  With the ERROR master gate
+ * opened by dsi_ctrl_enable() those bits refire every ~10us: a
+ * 100k/s interrupt storm that only exists in the non-inherit path
+ * (lk2nd never enables the group - INTR_CTRL stays 0x500).  Leave it
+ * off; "w1a.dsi_err" on the cmdline restores upstream behavior for
+ * debugging. */
+static bool w1a_dsi_noerr = true;
+static int __init w1a_dsi_err_setup(char *s)
+{
+	w1a_dsi_noerr = false;
+	return 1;
+}
+__setup("w1a.dsi_err", w1a_dsi_err_setup);
+
+/* W1A (noinherit): see the comment in dsi_link_clk_set_rate_6g() - when
+ * the running link clocks already match the requested rates (lk2nd
+ * handoff), do not touch the clock tree at all.  "w1a.no_dsi_rateskip"
+ * restores the upstream set_rate behavior for A/B testing. */
+static bool w1a_dsi_rateskip = true;
+static int __init w1a_no_dsi_rateskip_setup(char *s)
+{
+	w1a_dsi_rateskip = false;
+	return 1;
+}
+__setup("w1a.no_dsi_rateskip", w1a_no_dsi_rateskip_setup);
+
+/* W1A (v15): see the comment in msm_dsi_host_xfer_prepare().  Bare RCG
+ * update kick for the byte0 clock before each panel command. */
+static bool w1a_dsi_rcgkick = true;
+static int __init w1a_no_dsi_rcgkick_setup(char *s)
+{
+	w1a_dsi_rcgkick = false;
+	return 1;
+}
+__setup("w1a.no_dsi_rcgkick", w1a_no_dsi_rcgkick_setup);
+
+/* W1A (v16): lk2nd-style command TX - pre-clear INTR_CTRL + poll the
+ * DONE status instead of the GIC-IRQ completion wait.  See the comment
+ * in dsi_cmd_dma_tx(). */
+static bool w1a_cmdpoll = true;
+static int __init w1a_no_cmdpoll_setup(char *s)
+{
+	w1a_cmdpoll = false;
+	return 1;
+}
+__setup("w1a.no_cmdpoll", w1a_no_cmdpoll_setup);
+
+/* W1A (v23): keep the link clocks enabled between panel commands (see
+ * the comment in msm_dsi_host_xfer_restore()).  "w1a.no_clkhold"
+ * restores the per-command disable for A/B testing. */
+static bool w1a_dsi_clkhold = true;
+static int __init w1a_no_clkhold_setup(char *s)
+{
+	w1a_dsi_clkhold = false;
+	return 1;
+}
+__setup("w1a.no_clkhold", w1a_no_clkhold_setup);
+
+/* Byte0 RCG command register, GCC base 0x01800000 + 0x4d044 (gcc-msm8909).
+ * W1A: mapped without requesting - the gcc clock driver owns the region.
+ * CMD_UPDATE = BIT(0); the handshake clears when the update completes. */
+#define W1A_GCC_BASE       0x01800000UL
+#define W1A_BYTE0_CMD_RCGR 0x4d044UL
+static void __iomem *w1a_gcc_base;
+
+/*
+ * W1A (v20 forensics): step-by-step state snapshot through the re-enable
+ * path (definition sits after dsi_read; see below).
+ */
+static void w1a_step(const char *tag, struct msm_dsi_host *msm_host);
+
+static void w1a_byte_rcg_kick(struct msm_dsi_host *msm_host)
+{
+	void __iomem *cmd;
+	u32 val;
+	int count = 50;
+
+	if (!w1a_gcc_base) {
+		w1a_gcc_base = ioremap(W1A_GCC_BASE, SZ_1M);
+		if (!w1a_gcc_base) {
+			pr_err("MDP3DBG rcg kick: gcc ioremap failed\n");
+			return;
+		}
+	}
+	cmd = w1a_gcc_base + W1A_BYTE0_CMD_RCGR;
+
+	writel(readl(cmd) | BIT(0), cmd);
+	while (--count) {
+		val = readl(cmd);
+		if (!(val & BIT(0)))
+			return;
+		udelay(1);
+	}
+	pr_err("MDP3DBG rcg kick: byte0 update did not complete (cmd=%08x)\n",
+	       val);
+}
+
 /* W1A bring-up m2r: INHERIT mode.  The m2q handoff dump proved our
  * programmed DSI register state matches lk2nd's working state almost
  * register-for-register, yet the very first command (type=0x23) wedges
@@ -92,6 +193,29 @@ __setup("w1a.clkhs", w1a_clkhs_setup);
  * at kms init, bus state) and lives outside the DSI programming.
  * "w1a.no_dsi_inherit" restores the upstream flow for A/B testing. */
 bool w1a_dsi_inherit = true;
+
+/*
+ * W1A (v10 hybrid): inherit (keep the lk2nd handoff state) applies to
+ * the FIRST power_on after boot only.  The lk2nd handoff state has been
+ * proven to drive this panel (m2y-m4b: init commands complete, display
+ * alive, fps measured) - the full non-inherit reprogramming at boot has
+ * never produced a picture (v2-v9: every dumped register matches lk2nd
+ * yet the screen stays black; something outside the ~40 dumped regs
+ * differs).  The first power_OFF clears this flag, so a re-enable after
+ * a DPMS cycle takes the full path - from a clean, fully-powered-down
+ * state - with the v8/v9 fixes (raw PLL seeds, pixel-clk tolerance,
+ * post-enable divider rewrite) serving exactly that path.
+ */
+bool w1a_dsi_boot_inherit = true;
+
+/* v26: set once the boot-inherit period is over (first power_off).  See
+ * the tx-buffer switch in msm_dsi_host_power_on(). */
+bool w1a_dsi_boot_inherit_done;
+
+/* v36: true once the tx buffer moved to the raw-PA (lk2nd) page on the
+ * re-enable path.  mdp3_kms.c gates the SMMU re-attach + identity map
+ * on this - doing it at boot (GEM path) hung the first commit (v35). */
+bool w1a_dsi_pa_active;
 static int __init w1a_no_dsi_inherit_setup(char *s)
 {
 	w1a_dsi_inherit = false;
@@ -261,6 +385,34 @@ static inline u32 dsi_read(struct msm_dsi_host *msm_host, u32 reg)
 static inline void dsi_write(struct msm_dsi_host *msm_host, u32 reg, u32 data)
 {
 	writel(data, msm_host->ctrl_base + reg);
+}
+
+/*
+ * W1A (v20 forensics): step-by-step state snapshot through the re-enable
+ * path.  The failing DPMS wake shows clk_status=0x37cf (DSICLK domain
+ * half-enabled) and FIFO HS underflow by the time the first command is
+ * attempted, while every dumped config register matches lk2nd - so the
+ * corruption happens BETWEEN the power_on steps.  This prints the five
+ * "health" registers at each step boundary to bisect exactly where they
+ * diverge from the boot-time values (clk 0x234f, status0 0, fifo
+ * 0x11111000, int 0x500-ish).  Armed from the first non-boot power_on;
+ * the boot inherit path returns before these steps anyway.
+ */
+static void w1a_step(const char *tag, struct msm_dsi_host *msm_host)
+{
+	static bool armed;
+
+	if (w1a_dsi_boot_inherit)
+		return;
+	armed = true;
+
+	pr_info("MDP3STEP %-22s ctrl=%08x st0=%08x fifo=%08x clkst=%08x intc=%08x\n",
+		tag,
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0),
+		dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+		dsi_read(msm_host, REG_DSI_CLK_STATUS),
+		dsi_read(msm_host, REG_DSI_INTR_CTRL));
 }
 
 static const struct msm_dsi_cfg_handler *
@@ -468,6 +620,14 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 	DBG("Set clk rates: pclk=%lu, byteclk=%lu",
 	    msm_host->pixel_clk_rate, msm_host->byte_clk_rate);
 
+	/*
+	 * W1A (v6): set_rate runs normally (v4 behavior - skipping it
+	 * entirely hung the first commit at the fbcon takeover, v5).  The
+	 * VCO seed registers stay safe regardless: dsi_pll_28nm_clk_set_rate
+	 * is a no-op while the lk2nd raw config is captured, so this only
+	 * (re)programs the byte0/pclk0 RCG muxes and the byte/pixel
+	 * dividers around the untouched PLL.
+	 */
 	ret = dev_pm_opp_set_rate(&msm_host->pdev->dev,
 				  msm_host->byte_clk_rate);
 	if (ret) {
@@ -477,8 +637,34 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 
 	ret = clk_set_rate(msm_host->pixel_clk, msm_host->pixel_clk_rate);
 	if (ret) {
-		pr_err("%s: Failed to set rate pixel clk, %d\n", __func__, ret);
-		return ret;
+		/*
+		 * W1A (v7): clk_pixel_set_rate() only accepts a fixed set
+		 * of parent/child fractional ratios (frac_table_pixel: the
+		 * parent within 100 kHz of e.g. 33.485 MHz for a 12.557 MHz
+		 * pixel clock).  With the lk2nd raw PLL dividers kept (v6
+		 * set_rate no-op) the dsi0pll parent lands outside that
+		 * table and this returns -EINVAL, which used to abort the
+		 * whole power_on.  It does not matter on this hardware:
+		 * this is a COMMAND-MODE panel and lk2nd's own working
+		 * config leaves the pclk0 branch OFF with the RCG still on
+		 * XO (and a pending RCG update it never completes) - the
+		 * pixel clock is not part of the command-mode data path.
+		 * Log it once and carry on.
+		 */
+		if (w1a_dsi_rateskip) {
+			static bool logged;
+
+			if (!logged) {
+				pr_info("MDP3DBG dsi pixel clk set_rate %lu failed %d - ignored (cmd mode, pclk unused; lk2nd keeps pclk0 off)\n",
+					msm_host->pixel_clk_rate, ret);
+				logged = true;
+			}
+			ret = 0;
+		} else {
+			pr_err("%s: Failed to set rate pixel clk, %d\n",
+				__func__, ret);
+			return ret;
+		}
 	}
 
 	if (msm_host->byte_intf_clk) {
@@ -631,8 +817,11 @@ error:
 
 void dsi_link_clk_disable_6g(struct msm_dsi_host *msm_host)
 {
-	/* Drop the performance state vote */
-	dev_pm_opp_set_rate(&msm_host->pdev->dev, 0);
+	/* Drop the performance state vote - but see w1a_dsi_rateskip:
+	 * a zero target walks CLK_SET_RATE_PARENT up into the VCO and
+	 * writes 0 Hz divider/SDM garbage over the PLL. */
+	if (!w1a_dsi_rateskip)
+		dev_pm_opp_set_rate(&msm_host->pdev->dev, 0);
 	clk_disable_unprepare(msm_host->esc_clk);
 	clk_disable_unprepare(msm_host->pixel_clk);
 	clk_disable_unprepare(msm_host->byte_intf_clk);
@@ -976,7 +1165,8 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 	/* allow only ack-err-status to generate interrupt */
 	dsi_write(msm_host, REG_DSI_ERR_INT_MASK0, 0x13ff3fe0);
 
-	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
+	if (!w1a_dsi_noerr)
+		dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
 
 	dsi_write(msm_host, REG_DSI_CLK_CTRL, DSI_CLK_CTRL_ENABLE_CLKS);
 
@@ -1360,6 +1550,22 @@ int dsi_tx_buf_alloc_6g(struct msm_dsi_host *msm_host, int size)
 
 	msm_host->tx_size = msm_host->tx_gem_obj->size;
 
+	/*
+	 * W1A (v13): hold the vmap for the driver lifetime - per-command
+	 * get/put let the GEM shrinker vunmap() during display-off periods
+	 * and the next command Oopsed on a NULL pointer.  See
+	 * dsi_tx_buf_get_6g().
+	 */
+	msm_host->tx_buf = msm_gem_get_vaddr(msm_host->tx_gem_obj);
+	if (IS_ERR(msm_host->tx_buf)) {
+		int ret = PTR_ERR(msm_host->tx_buf);
+
+		msm_host->tx_buf = NULL;
+		drm_gem_object_put(msm_host->tx_gem_obj);
+		msm_host->tx_gem_obj = NULL;
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -1381,7 +1587,6 @@ void msm_dsi_tx_buf_free(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 	struct drm_device *dev = msm_host->dev;
-
 	/*
 	 * This is possible if we're tearing down before we've had a chance to
 	 * fully initialize. A very real possibility if our probe is deferred,
@@ -1392,6 +1597,11 @@ void msm_dsi_tx_buf_free(struct mipi_dsi_host *host)
 		return;
 
 	if (msm_host->tx_gem_obj) {
+		if (msm_host->tx_buf) {
+			/* v13: drop the lifetime vmap taken at alloc */
+			msm_gem_put_vaddr(msm_host->tx_gem_obj);
+			msm_host->tx_buf = NULL;
+		}
 		msm_gem_kernel_put(msm_host->tx_gem_obj, msm_host->vm);
 		drm_gpuvm_put(msm_host->vm);
 		msm_host->tx_gem_obj = NULL;
@@ -1415,11 +1625,15 @@ void *dsi_tx_buf_get_6g(struct msm_dsi_host *msm_host)
 	if (w1a_dsi_pa)
 		return msm_host->tx_buf;
 
-	return msm_gem_get_vaddr(msm_host->tx_gem_obj);
-}
-
-void *dsi_tx_buf_get_v2(struct msm_dsi_host *msm_host)
-{
+	/*
+	 * W1A (v13): the tx buffer vmap is held for the driver lifetime
+	 * (taken once at alloc) instead of per-command get/put.  The GEM
+	 * shrinker may vunmap() the object between commands once the
+	 * vmap_count drops to zero during a display-off period - the next
+	 * command then hit a NULL data pointer (Oops in dsi_cmds2buf_tx,
+	 * v11 second DPMS cycle).  A permanently-mapped 4K command buffer
+	 * is cheap; drop it only in msm_dsi_tx_buf_free().
+	 */
 	return msm_host->tx_buf;
 }
 
@@ -1428,7 +1642,12 @@ void dsi_tx_buf_put_6g(struct msm_dsi_host *msm_host)
 	if (w1a_dsi_pa)
 		return;
 
-	msm_gem_put_vaddr(msm_host->tx_gem_obj);
+	/* v13: nothing - see dsi_tx_buf_get_6g() */
+}
+
+void *dsi_tx_buf_get_v2(struct msm_dsi_host *msm_host)
+{
+	return msm_host->tx_buf;
 }
 
 /*
@@ -1556,6 +1775,38 @@ int dsi_dma_base_get_v2(struct msm_dsi_host *msm_host, uint64_t *dma_base)
 	return 0;
 }
 
+/*
+ * W1A (v31): second half of the stock force-HS protocol (mdss_dsi_
+ * stop_hs_clk_lane, simplified): wait for the command FIFOs to drain,
+ * then release the CLKLN_HS_FORCE_REQUEST bit so the clock lane returns
+ * to LP stop.  Called after every polled command transfer.
+ */
+static void w1a_lane_force_release(struct msm_dsi_host *msm_host)
+{
+	u32 fifo = 0, lane = 0, data;
+	int n;
+
+	/* FIFO_STATUS 0x000c: bits 16/20/24/28 = per-lane "empty" */
+	for (n = 0; n < 100; n++) {
+		fifo = dsi_read(msm_host, REG_DSI_FIFO_STATUS);
+		if ((fifo & 0x11110000) == 0x11110000)
+			break;
+		udelay(10);
+	}
+
+	/* LANE_STATUS 0x00a8: low nibble = per-lane stop state */
+	for (n = 0; n < 20; n++) {
+		lane = dsi_read(msm_host, REG_DSI_LANE_STATUS);
+		if ((lane & 0xf) == 0xf)
+			break;
+		udelay(100);
+	}
+
+	data = dsi_read(msm_host, REG_DSI_LANE_CTRL);
+	dsi_write(msm_host, REG_DSI_LANE_CTRL,
+		  data & ~DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST);
+}
+
 static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 {
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
@@ -1573,8 +1824,113 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 
 	dsi_wait4video_eng_busy(msm_host);
 
+	/*
+	 * W1A (v16): lk2nd mdss_dsi_cmd_dma_trigger_for_panel() port.
+	 * lk2nd clears ALL INTR_CTRL status bits and enables the masks
+	 * (0x03030303) before EVERY trigger, then POLLS the CMD_DMA_DONE
+	 * status bit instead of depending on GIC interrupt delivery.
+	 * The mainline completion-wait path loses the completion on the
+	 * re-enable after DPMS-off: the engine reads back idle, clocks
+	 * healthy, yet wait_for_completion times out (-110) - which then
+	 * aborts the rest of the panel init (black screen).  Bypass the
+	 * IRQ chain entirely and use the proven-good register sequence.
+	 * "w1a.no_cmdpoll" on the cmdline restores the upstream path.
+	 */
+	if (w1a_cmdpoll) {
+		u32 done = 0;
+		int n;
+		unsigned long irqflags;
+
+		/*
+		 * W1A (v31): stock 8909 errata protocol, ported from
+		 * mdss_dsi_cmd_start/stop_hs_clk_lane (3.18
+		 * mdss_dsi_host.c): the command DMA needs the DSI clock
+		 * lane FORCED into high-speed before every trigger, and
+		 * released after - "w1a_dsi_noclkhs" (m2p) cleared
+		 * LANE_CTRL BIT(28) permanently, which worked only because
+		 * the boot-inherit path inherited lk2nd's already-running
+		 * lane.  After a full re-enable the lane sits in LP-stop
+		 * and the fetch never starts (every v11-v30 wake failure:
+		 * engine healthy, clkst missing the dynamic-DSICLK bit).
+		 */
+		{
+			u32 lane_ctrl = dsi_read(msm_host, REG_DSI_LANE_CTRL);
+
+			dsi_write(msm_host, REG_DSI_LANE_CTRL,
+				  lane_ctrl | DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST);
+		}
+
+		local_irq_save(irqflags);
+		w1a_step("cmd: pre-trigger", msm_host);
+		dsi_write(msm_host, REG_DSI_INTR_CTRL, 0x03030303);
+
+		triggered = msm_dsi_manager_cmd_xfer_trigger(
+							msm_host->id, dma_base, len);
+		if (!triggered) {
+			local_irq_restore(irqflags);
+			return len;
+		}
+
+		for (n = 0; n < 200000; n++) {
+			done = dsi_read(msm_host, REG_DSI_INTR_CTRL) & 0x1;
+			if (done)
+				break;
+			udelay(1);
+		}
+
+		if (done) {
+			/* lk2nd's ack: W1C the DONE and ERROR status bits */
+			dsi_write(msm_host, REG_DSI_INTR_CTRL,
+				  dsi_read(msm_host, REG_DSI_INTR_CTRL) |
+				  0x01000001);
+			local_irq_restore(irqflags);
+			w1a_lane_force_release(msm_host);
+			return len;
+		}
+
+		/*
+		 * W1A (v24): one diagnostic retry - fresh INTR_CTRL sweep
+		 * and a second trigger, with the pre-retry state recorded in
+		 * the ramoops mailbox (NOT printk - this can run under
+		 * console_lock; NOT extra register reads - see the v24
+		 * lesson in msm_dsi_host_cmd_xfer_commit).  If the retry
+		 * completes, the first trigger write was lost; if not, the
+		 * fetch is refused downstream.
+		 */
+		w1a_mb("cmd timeout: st0=%08x fifo=%08x - retrying trigger",
+		       dsi_read(msm_host, REG_DSI_STATUS0),
+		       dsi_read(msm_host, REG_DSI_FIFO_STATUS));
+
+		dsi_write(msm_host, REG_DSI_INTR_CTRL, 0x03030303);
+		dsi_write(msm_host, REG_DSI_DMA_BASE, dma_base);
+		dsi_write(msm_host, REG_DSI_DMA_LEN, len);
+		dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
+		wmb();
+
+		for (n = 0; n < 200000; n++) {
+			done = dsi_read(msm_host, REG_DSI_INTR_CTRL) & 0x1;
+			if (done)
+				break;
+			udelay(1);
+		}
+
+		w1a_mb("cmd retry: done=%u", done);
+		if (done) {
+			dsi_write(msm_host, REG_DSI_INTR_CTRL,
+				  dsi_read(msm_host, REG_DSI_INTR_CTRL) |
+				  0x01000001);
+			local_irq_restore(irqflags);
+			w1a_lane_force_release(msm_host);
+			return len;
+		}
+
+		local_irq_restore(irqflags);
+		w1a_lane_force_release(msm_host);
+		return -ETIMEDOUT;
+	}
+
 	triggered = msm_dsi_manager_cmd_xfer_trigger(
-						msm_host->id, dma_base, len);
+					msm_host->id, dma_base, len);
 	if (triggered) {
 		ret = wait_for_completion_timeout(&msm_host->dma_comp,
 					msecs_to_jiffies(200));
@@ -1897,7 +2253,8 @@ static void dsi_err_worker(struct work_struct *work)
 	msm_host->err_work_state = 0;
 
 	/* enable dsi error interrupt */
-	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
+	if (!w1a_dsi_noerr)
+		dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
 }
 
 static void dsi_ack_err_status(struct msm_dsi_host *msm_host)
@@ -1947,6 +2304,16 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 	u32 status;
 
 	status = dsi_read(msm_host, REG_DSI_FIFO_STATUS);
+
+	/*
+	 * W1A: the *_FIFO_EMPTY bits (12,16,20,24,28) read back set when
+	 * the FIFOs are idle - 0x11111000 is the NORMAL all-empty value
+	 * on this hardware (lk2nd's handoff dump shows the same).  Only
+	 * the overflow/underflow bits are errors; classifying the idle
+	 * value as a FIFO error made every dsi_error() pass report a
+	 * bogus FIFO error.
+	 */
+	status &= 0xcccc4489;
 
 	/* fifo underflow, overflow */
 	if (status) {
@@ -2470,8 +2837,36 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 	 * mdp clock need to be enabled to receive dsi interrupt
 	 */
 	pm_runtime_get_sync(&msm_host->pdev->dev);
-	cfg_hnd->ops->link_clk_set_rate(msm_host);
-	cfg_hnd->ops->link_clk_enable(msm_host);
+	/*
+	 * W1A (v15): re-trigger ONLY the byte0 RCG update before every
+	 * command.  The full link_clk_set_rate() re-arms the RCG config AND
+	 * rewrites the PLL divider/seed registers - even with identical
+	 * values the write pulses disturb the running clock (v14 R2
+	 * clk_status 0x37cf, first init cmd -110).  A bare RCG update
+	 * handshake (CMD_UPDATE bit) is the part that mattered: after a
+	 * full phy/PLL power cycle the byte clock domain needs one
+	 * completed update before command DMA works (v11-with-set_rate
+	 * completed the same cycle; v13 without it wedged the first cmd).
+	 * clk_set_rate() on the byte clock would recompute dividers, so
+	 * poke the RCG cmd register directly through the same regmap the
+	 * clock driver uses.
+	 */
+	if (w1a_dsi_rcgkick)
+		w1a_byte_rcg_kick(msm_host);
+	/*
+	 * W1A (v33): with clkhold the link clocks stay enabled between
+	 * commands - do NOT take another enable refcount per command.
+	 * The accumulated counts (one per xfer, never released since v23)
+	 * desynchronized the clk framework from the hardware: power_off's
+	 * single disable left the tree "enabled" in software while the
+	 * VCO unprepare never ran - and on the next wake the VCO prepare
+	 * was skipped entirely (clk core thought it still prepared) even
+	 * though the PLL was physically off.  Keeping the counts balanced
+	 * (power_on enables once, power_off disables once) lets the
+	 * unprepare/prepare pair run properly across a DPMS cycle.
+	 */
+	if (!w1a_dsi_clkhold)
+		cfg_hnd->ops->link_clk_enable(msm_host);
 
 	/* TODO: vote for bus bandwidth */
 
@@ -2502,8 +2897,23 @@ void msm_dsi_host_xfer_restore(struct mipi_dsi_host *host,
 
 	/* TODO: unvote for bus bandwidth */
 
-	cfg_hnd->ops->link_clk_disable(msm_host);
-	pm_runtime_put(&msm_host->pdev->dev);
+	/*
+	 * W1A (v23): do NOT disable the link clocks between commands.
+	 * The v22 forensics showed the "unsettled window" (st0=5, HS FIFO
+	 * underflow, DSICLK 0x37cf) is NOT a one-shot first-transfer
+	 * artifact: the sacrificial first write crossed it, ~290 ms later
+	 * the next real command hit the SAME window again.  Every
+	 * per-command clk disable->enable cycle re-enters it - the byte
+	 * clock domain needs settling time after each re-enable, and
+	 * nothing guarantees it.  The enable/disable pair around each
+	 * transfer only serves refcounting; the clocks stay up from
+	 * power_on until power_off (esc/byte/pixel are gated with the
+	 * controller at power_off anyway).
+	 */
+	if (!w1a_dsi_clkhold) {
+		cfg_hnd->ops->link_clk_disable(msm_host);
+		pm_runtime_put(&msm_host->pdev->dev);
+	}
 }
 
 int msm_dsi_host_cmd_tx(struct mipi_dsi_host *host,
@@ -2657,12 +3067,38 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host, u32 dma_base,
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	/*
+	 * W1A (v34): cache sync before the trigger.  The tx buffer on the
+	 * re-enable path is the lk2nd /memreserve/ page mapped through
+	 * __va() - a NORMAL CACHED mapping.  The CPU writes land in the
+	 * D-cache; the DSI command DMA reads from DDR and fetches stale
+	 * data unless the range is cleaned first.  (The GEM path used at
+	 * boot is MSM_BO_WC - write-combined, uncached - which is why
+	 * boot commands worked without any of this.)  This mirrors the
+	 * stock driver's dma_map_single(..., DMA_TO_DEVICE) in
+	 * mdss_dsi_cmd_dma_tx.
+	 */
+	if (w1a_dsi_pa && msm_host->tx_buf)
+		dma_sync_single_for_device(&msm_host->pdev->dev,
+					   (dma_addr_t)dma_base, len,
+					   DMA_TO_DEVICE);
+
 	dsi_write(msm_host, REG_DSI_DMA_BASE, dma_base);
 	dsi_write(msm_host, REG_DSI_DMA_LEN, len);
 	dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
 
 	/* Make sure trigger happens */
 	wmb();
+
+	/*
+	 * W1A (v24 lesson): do NOT read the DSI registers back here - a
+	 * read landing while the command DMA is starting wedged the bus
+	 * and reset the SoC (v24 boot coredump, mailbox truncated at the
+	 * init-seq marker).  This hardware's DSI bank is not safe for CPU
+	 * reads in that window; forensics go through the ramoops mailbox
+	 * (w1a_mb) instead, which never touches these registers.
+	 */
+	w1a_mb("cmd committed: base=%08x len=%08x", dma_base, len);
 }
 
 void msm_dsi_host_set_phy_mode(struct mipi_dsi_host *host,
@@ -2813,12 +3249,13 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
 
-	if (w1a_dsi_inherit) {
+	if (w1a_dsi_inherit && w1a_dsi_boot_inherit) {
 		/* m2r: keep the lk2nd handoff state untouched - no set_rate
 		 * (the RCG update WARNs show it fails mid-update anyway),
 		 * no timing_setup, no sw_reset, no ctrl_enable.  The link
 		 * clocks are already running with lk2nd's rates; only take
-		 * enable refcounts so pm-symmetric teardown still works. */
+		 * enable refcounts so pm-symmetric teardown still works.
+		 * v10: BOOT ONLY - see w1a_dsi_boot_inherit. */
 		pr_info("MDP3DBG dsi power_on INHERIT: skipping set_rate/timing/sw_reset/ctrl_enable, ctrl=%08x status0=%08x\n",
 			dsi_read(msm_host, REG_DSI_CTRL),
 			dsi_read(msm_host, REG_DSI_STATUS0));
@@ -2833,14 +3270,89 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		return 0;
 	}
 
+	w1a_step("power_on: entry", msm_host);
+
+	/*
+	 * W1A (v26): switch the tx buffer to a raw physical address for
+	 * the re-enable path.  The boot handoff needs the GEM/IOVA path
+	 * (raw-PA + lk2nd's live state wedge - v12), but after a full
+	 * power cycle the picture inverts: v25 forensics show every
+	 * re-enable command failing with a HEALTHY engine and the DMA
+	 * fetch never completing - consistent with the GEM object's IOVA
+	 * mapping being stale in the re-attached SMMU domain (the fetch
+	 * dies in address translation, no CB4 fault latched).  m2y
+	 * historically proved raw-PA + full re-init DOES drive the panel.
+	 * Drop the GEM buffer, allocate a coherent PA buffer instead.
+	 */
+	if (w1a_dsi_boot_inherit_done && msm_host->tx_gem_obj) {
+		struct mipi_dsi_host *mhost = &msm_host->base;
+
+		if (msm_host->tx_buf)
+			msm_gem_put_vaddr(msm_host->tx_gem_obj);
+		msm_gem_kernel_put(msm_host->tx_gem_obj, msm_host->vm);
+		drm_gpuvm_put(msm_host->vm);
+		msm_host->tx_gem_obj = NULL;
+		msm_host->vm = NULL;
+
+		/*
+		 * W1A (v28): use the FIXED LOW-memory page that lk2nd
+		 * itself uses for its command DMA (DTS /memreserve/
+		 * 0x08f68f000 0x1000 - the kernel never allocates it, and
+		 * lk2nd drives this panel's init from it on every cold
+		 * boot).  v26/v27 allocated a CMA page at ~0x9b8ae000 -
+		 * the high end of RAM on this 512 MB device - and every
+		 * wake command still failed with a healthy engine: the DSI
+		 * command DMA cannot fetch from up there (matches the
+		 * downstream/lk2nd world where command buffers always live
+		 * in low memory).  Map the reserved page WC and use its
+		 * physical address directly.
+		 */
+		msm_host->tx_buf = memremap(0x08f68f000, SZ_4K, MEMREMAP_WC);
+		if (!msm_host->tx_buf) {
+			/*
+			 * arm32 memremap refuses RAM pages (the /memreserve/
+			 * region is mapped, not nomap) - same lesson as the
+			 * ramoops mailbox (m2s/v6).  The linear mapping
+			 * covers it; __va() needs no mapping at all.  It is
+			 * write-combined via the normal kernel mapping, which
+			 * is fine for a command buffer that is always fully
+			 * written before each trigger (wmb() in the commit).
+			 */
+			msm_host->tx_buf = __va(0x08f68f000);
+		}
+		if (msm_host->tx_buf) {
+			msm_host->tx_buf_paddr = 0x08f68f000;
+			msm_host->tx_size = SZ_4K;
+			w1a_dsi_pa = true;
+			w1a_dsi_pa_active = true;
+			pr_info("MDP3DBG tx buf: fixed lk2nd page 0x08f68f000 for re-enable (va=%px)\n",
+				msm_host->tx_buf);
+		} else {
+			pr_err("MDP3DBG lk2nd page mapping failed\n");
+		}
+	}
+
 	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+	w1a_step("after set_rate", msm_host);
 	if (!ret)
 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
+	w1a_step("after clk_enable", msm_host);
 	if (ret) {
 		pr_err("%s: failed to enable link clocks. ret=%d\n",
 		       __func__, ret);
 		goto fail_disable_reg;
 	}
+
+	/*
+	 * W1A (v9): the clk framework's divider ops just reprogrammed the
+	 * PLL post-dividers (POSTDIV3_CFG / VREG_CFG) with computed values
+	 * that leave the byte clock functionally wrong - HS FIFO underflow,
+	 * no picture.  Rewrite the captured lk2nd configuration AFTER the
+	 * clk core is done; nothing touches these registers again until the
+	 * next power cycle.
+	 */
+	msm_dsi_phy_pll_write_raw(phy);
+	w1a_step("after pll_write_raw", msm_host);
 
 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
 	if (ret) {
@@ -2848,14 +3360,35 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			__func__, ret);
 		goto fail_disable_clk;
 	}
+	w1a_step("after pinctrl", msm_host);
 
 	dsi_timing_setup(msm_host, is_bonded_dsi);
+	w1a_step("after timing_setup", msm_host);
 	pr_info("MDP3DBG dsi timing_setup done, sw_reset\n");
 	w1a_mb("dsi timing done, sw_reset next");
-	dsi_sw_reset(msm_host);
+	if (w1a_dsi_boot_inherit_done) {
+		/*
+		 * W1A (v30): skip the DSI controller soft reset on the
+		 * re-enable path.  The reset runs AFTER the PHY has been
+		 * fully re-enabled (vendor analog sequence + PLL relock) -
+		 * it partially invalidates the PHY's trained state, and the
+		 * resulting DSICLK domain never reaches the continuous
+		 * active state it has under lk2nd (power_on entry shows
+		 * clkst=0x34f vs lk2nd's 0x234f; every command attempt then
+		 * sees the half-enabled 0x37cf glitch).  lk2nd never resets
+		 * the controller between command sequences - the sw_reset
+		 * belongs to initial bring-up only (and disable-time, see
+		 * msm_dsi_host_disable).
+		 */
+		pr_info("MDP3DBG dsi sw_reset SKIPPED (re-enable path)\n");
+	} else {
+		dsi_sw_reset(msm_host);
+	}
+	w1a_step("after sw_reset", msm_host);
 	pr_info("MDP3DBG dsi sw_reset done, ctrl_enable\n");
 	w1a_mb("dsi sw_reset done");
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+	w1a_step("after ctrl_enable", msm_host);
 	pr_info("MDP3DBG dsi ctrl_enable done: clk_status=%08x status0=%08x\n",
 		dsi_read(msm_host, REG_DSI_CLK_STATUS),
 		dsi_read(msm_host, REG_DSI_STATUS0));
@@ -2902,6 +3435,11 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 	DBG("-");
 
 	msm_host->power_on = false;
+
+	/* v10 hybrid: the handoff state is gone after a full power_off -
+	 * every later power_on must take the full programming path. */
+	w1a_dsi_boot_inherit = false;
+	w1a_dsi_boot_inherit_done = true;
 
 unlock_ret:
 	mutex_unlock(&msm_host->dev_mutex);

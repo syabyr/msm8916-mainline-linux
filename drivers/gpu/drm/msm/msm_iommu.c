@@ -672,6 +672,62 @@ static void msm_iommu_detach(struct msm_mmu *mmu)
 	iommu_detach_device(iommu->domain, mmu->dev);
 }
 
+/*
+ * W1A (v32): re-attach the display IOMMU domain, reprogramming TTBR0
+ * and the context banks.  The 3.18 stock driver attach/detaches around
+ * every command batch (mdss_dsi_cmd_tx -> iommu_ctrl(1/0)); on mainline
+ * the domain is attached once at init and qcom_iommu's runtime PM can
+ * power the SMMU context off across a display power cycle - leaving
+ * the MDSS port's fetches hanging in translation with no fault latched.
+ * Re-attach restores the context.  Returns 0 on success.
+ */
+int msm_iommu_reattach(struct msm_mmu *mmu)
+{
+	struct msm_iommu *iommu = to_msm_iommu(mmu);
+	int ret;
+
+	if (mmu->type != MSM_MMU_IOMMU)
+		return -EINVAL;
+
+	iommu_detach_device(iommu->domain, mmu->dev);
+	ret = iommu_attach_device(iommu->domain, mmu->dev);
+	if (ret)
+		pr_err("MDP3DBG iommu reattach failed: %d\n", ret);
+	return ret;
+}
+
+/*
+ * W1A (v35): identity-map a physical page into the display domain
+ * (IOVA == PA).  The DSI command tx buffer on the re-enable path is
+ * the lk2nd /memreserve/ page at a raw physical address; once the
+ * domain is attached (translated mode - the port is switched out of
+ * bypass by qcom_scm_restore_sec_cfg on attach), every fetch through
+ * it must hit a page-table entry.  v34's wake failure finally latched
+ * the smoking gun: CB4 translation fault, far=0x8f68f000 (the tx
+ * buffer PA, unmapped).  Stock maps/unmaps its command buffer around
+ * every batch (mdss_smmu_dsi_map_buffer); we map the fixed page once
+ * per re-attach.
+ */
+int msm_iommu_map_page_ident(struct msm_mmu *mmu, phys_addr_t pa, size_t size)
+{
+	struct msm_iommu *iommu = to_msm_iommu(mmu);
+	size_t ret;
+
+	if (mmu->type != MSM_MMU_IOMMU)
+		return -EINVAL;
+
+	/* public API: handles pgsize/page-count internally (v35 hung the
+	 * boot CPU by calling the domain's map_pages op directly) */
+	ret = iommu_map(iommu->domain, (unsigned long)pa, pa, size,
+			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret) {
+		pr_err("MDP3DBG ident map %pa failed: %zd\n", &pa, ret);
+		return ret;
+	}
+	pr_info("MDP3DBG ident mapped %pa +%zx\n", &pa, size);
+	return 0;
+}
+
 static int msm_iommu_map(struct msm_mmu *mmu, uint64_t iova,
 			 struct sg_table *sgt, size_t off, size_t len,
 			 int prot)

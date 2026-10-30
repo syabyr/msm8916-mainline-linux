@@ -548,6 +548,17 @@
 					     0x03 0x03 0x04 0x00>;
 		qcom,dphy-clk-pre = <0x10>;
 		qcom,dphy-clk-post = <0x07>;
+
+		/*
+		 * PHY internal regulator in LDO mode, matching stock
+		 * (qcom,regulator-ldo-mode + platform-regulator-settings
+		 * [00 01 01 00 20 07 00]) and lk2nd
+		 * (DSI_PHY_REGULATOR_LDO_MODE).  Without this the 28nm
+		 * driver programs the DC-DC values instead and the PHY
+		 * never powers - the DSI link stays dead whenever the
+		 * non-inherit phy-enable path runs.
+		 */
+		qcom,dsi-phy-regulator-ldo-mode;
 	};
 };
 

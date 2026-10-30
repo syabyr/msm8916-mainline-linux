@@ -75,6 +75,10 @@ static inline void msm_mmu_init(struct msm_mmu *mmu, struct device *dev,
 }
 
 struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks);
+/* W1A: re-attach the display domain after a power cycle (msm_iommu.c) */
+int msm_iommu_reattach(struct msm_mmu *mmu);
+/* W1A: identity-map (IOVA==PA) a page for raw-PA command buffers */
+int msm_iommu_map_page_ident(struct msm_mmu *mmu, phys_addr_t pa, size_t size);
 struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks);
 struct msm_mmu *msm_iommu_disp_new(struct device *dev, unsigned long quirks);
 

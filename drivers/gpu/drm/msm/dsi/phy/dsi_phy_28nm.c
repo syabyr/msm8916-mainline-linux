@@ -68,12 +68,34 @@ struct pll_28nm_cached_state {
 	u8 byte_mux;
 };
 
+/*
+ * W1A (v5): raw PLL configuration captured from the lk2nd handoff.
+ * The mainline set_rate() seed math produces a DIFFERENT (locking, but
+ * functionally wrong for this panel/PHY) configuration than lk2nd's
+ * proven one - sdm1 0x0e vs 0x4e, postdiv3 0x2f vs 0x11 - leaving LP
+ * commands working but the HS data path dead (black screen).  With
+ * link-clk set_rate() skipped entirely (w1a_dsi_rateskip), the
+ * restore path below rewrites these registers verbatim instead of
+ * recomputing them.
+ */
+struct pll_28nm_raw_state {
+	bool captured;
+	u32 refclk;	/* 0x00 */
+	u32 postdiv1;	/* 0x04 */
+	u32 vreg;	/* 0x10 */
+	u32 postdiv3;	/* 0x28 */
+	u32 sdm0, sdm1, sdm2, sdm3, sdm4;	/* 0x38..0x48 */
+	u32 cal_cfg0, cal_cfg1;		/* 0x6c, 0x70 */
+};
+
 struct dsi_pll_28nm {
 	struct clk_hw clk_hw;
 
 	struct msm_dsi_phy *phy;
 
 	struct pll_28nm_cached_state cached_state;
+
+	struct pll_28nm_raw_state raw;
 };
 
 #define to_pll_28nm(x)	container_of(x, struct dsi_pll_28nm, clk_hw)
@@ -129,6 +151,40 @@ static int dsi_pll_28nm_clk_set_rate(struct clk_hw *hw, unsigned long rate,
 	int i;
 
 	VERB("rate=%lu, parent's=%lu", rate, parent_rate);
+
+	/*
+	 * W1A (v8): with lk2nd's raw handoff config captured at probe,
+	 * program THOSE seeds instead of the computed ones.  Two effects:
+	 * (a) on the boot handoff this writes the exact values already in
+	 * the registers (zero disturbance to the running, locked PLL) while
+	 * keeping the clk framework bookkeeping happy - unlike the v6/v7
+	 * no-op variant, which let the byte-clock enable reach
+	 * vco_prepare_lp with the "already locked" shortcut somehow
+	 * missing and the subsequent software_reset wiped the seeds ->
+	 * "DSI PLL lock failed" -> power_on -22;
+	 * (b) after a real power cycle (DPMS off) the seeds are rewritten
+	 * for the relock.  The computed math locks at a functionally
+	 * different configuration (sdm1 0x4e vs 0x0e) that leaves the HS
+	 * data path dead - black screen (v2-v4).
+	 */
+	if (pll_28nm->raw.captured) {
+		struct pll_28nm_raw_state *r = &pll_28nm->raw;
+
+		writel(r->refclk, base + 0x00);
+		writel(r->postdiv1, base + 0x04);
+		writel(r->postdiv3, base + 0x28);
+		writel(r->sdm0, base + 0x38);
+		writel(r->sdm1, base + 0x3c);
+		writel(r->sdm2, base + 0x40);
+		writel(r->sdm3, base + 0x44);
+		writel(r->sdm4, base + 0x48);
+		writel(r->cal_cfg0, base + 0x6c);
+		writel(r->cal_cfg1, base + 0x70);
+		pll_28nm->cached_state.vco_rate = rate;
+		DRM_DEV_INFO(dev, "MDP3DBG pll set_rate(%lu) -> raw lk2nd seeds rewritten\n",
+			     rate);
+		return 0;
+	}
 
 	/* Force postdiv2 to be div-4 */
 	writel(3, base + REG_DSI_28nm_PHY_PLL_POSTDIV2_CFG);
@@ -487,14 +543,65 @@ static int dsi_pll_28nm_vco_prepare_lp(struct clk_hw *hw)
 	 * -> -EINVAL from clk_prepare_enable(byte_clk) -> host power_on fail
 	 * -> every panel command -EINVAL (m2v black screen).  An already
 	 * locked VCO needs nothing: mark it on and let the clk framework
-	 * take its refcount. */
+	 * take its refcount.
+	 *
+	 * v5: this is also the one-time opportunity to capture the raw PLL
+	 * configuration - the seeds lk2nd actually drives this panel with -
+	 * for the raw restore path in dsi_28nm_pll_restore_state(). */
 	if (dsi_pll_28nm_clk_is_enabled(hw)) {
+		if (!pll_28nm->raw.captured) {
+			struct pll_28nm_raw_state *r = &pll_28nm->raw;
+			void __iomem *b = pll_28nm->phy->pll_base;
+
+			r->refclk = readl(b + 0x00);
+			r->postdiv1 = readl(b + 0x04);
+			r->vreg = readl(b + 0x10);
+			r->postdiv3 = readl(b + 0x28);
+			r->sdm0 = readl(b + 0x38);
+			r->sdm1 = readl(b + 0x3c);
+			r->sdm2 = readl(b + 0x40);
+			r->sdm3 = readl(b + 0x44);
+			r->sdm4 = readl(b + 0x48);
+			r->cal_cfg0 = readl(b + 0x6c);
+			r->cal_cfg1 = readl(b + 0x70);
+			r->captured = true;
+			dev_info(dev,
+				 "MDP3DBG pll handoff captured: refclk=%02x postdiv1=%02x postdiv3=%02x sdm=%02x %02x %02x %02x %02x cal=%02x %02x\n",
+				 r->refclk, r->postdiv1, r->postdiv3,
+				 r->sdm0, r->sdm1, r->sdm2, r->sdm3, r->sdm4,
+				 r->cal_cfg0, r->cal_cfg1);
+		}
 		dev_info(dev, "MDP3DBG pll inherit: VCO already locked, skipping reprogram\n");
 		pll_28nm->phy->pll_on = true;
 		return 0;
 	}
 
 	pll_28nm_software_reset(pll_28nm);
+
+	/*
+	 * W1A (v8): the software reset above wipes the SDM/CAL seed
+	 * registers to their reset defaults - relocking on those fails
+	 * ("DSI PLL lock failed", the m2w lesson).  Rewrite the captured
+	 * lk2nd seeds between the reset and the power-up so the relock
+	 * lands on the proven configuration.  (On the boot handoff this
+	 * path is not reached at all - the locked-VCO shortcut above
+	 * returns early.)
+	 */
+	if (pll_28nm->raw.captured) {
+		struct pll_28nm_raw_state *r = &pll_28nm->raw;
+
+		writel(r->refclk, base + 0x00);
+		writel(r->postdiv1, base + 0x04);
+		writel(r->postdiv3, base + 0x28);
+		writel(r->sdm0, base + 0x38);
+		writel(r->sdm1, base + 0x3c);
+		writel(r->sdm2, base + 0x40);
+		writel(r->sdm3, base + 0x44);
+		writel(r->sdm4, base + 0x48);
+		writel(r->cal_cfg0, base + 0x6c);
+		writel(r->cal_cfg1, base + 0x70);
+		dev_info(dev, "MDP3DBG pll prepare: raw seeds rewritten after sw reset\n");
+	}
 
 	/*
 	 * PLL power up sequence.
@@ -609,12 +716,88 @@ static void dsi_28nm_pll_save_state(struct msm_dsi_phy *phy)
 		cached_state->vco_rate = 0;
 }
 
+/*
+ * W1A (v9): rewrite the captured lk2nd PLL configuration - ALL eleven
+ * registers including the POSTDIV3_CFG (0x28, the dsi0pll divider) and
+ * VREG_CFG (0x10, the byte mux) that the clk framework's divider ops
+ * reprogram AFTER dsi_pll_28nm_clk_set_rate() returns.  The computed
+ * divider chain (postdiv3 0x11 vs lk2nd's 0x2f) leaves the byte clock
+ * functionally wrong: HS FIFO underflow, no picture (v8).  Call this
+ * from the dsi host power_on once the link clocks are enabled - at
+ * that point nothing in the clk core touches these registers again.
+ */
+void msm_dsi_phy_pll_write_raw(struct msm_dsi_phy *phy)
+{
+	struct dsi_pll_28nm *pll_28nm = to_pll_28nm(phy->vco_hw);
+	struct pll_28nm_raw_state *r = &pll_28nm->raw;
+	void __iomem *base = pll_28nm->phy->pll_base;
+
+	if (!r->captured || !base)
+		return;
+
+	writel(r->refclk, base + 0x00);
+	writel(r->postdiv1, base + 0x04);
+	writel(r->vreg, base + 0x10);
+	writel(r->postdiv3, base + 0x28);
+	writel(r->sdm0, base + 0x38);
+	writel(r->sdm1, base + 0x3c);
+	writel(r->sdm2, base + 0x40);
+	writel(r->sdm3, base + 0x44);
+	writel(r->sdm4, base + 0x48);
+	writel(r->cal_cfg0, base + 0x6c);
+	writel(r->cal_cfg1, base + 0x70);
+	DRM_DEV_INFO(&phy->pdev->dev,
+		     "MDP3DBG pll raw config rewritten post-enable (postdiv3=%02x vreg=%02x)\n",
+		     r->postdiv3, r->vreg);
+}
+
 static int dsi_28nm_pll_restore_state(struct msm_dsi_phy *phy)
 {
 	struct dsi_pll_28nm *pll_28nm = to_pll_28nm(phy->vco_hw);
 	struct pll_28nm_cached_state *cached_state = &pll_28nm->cached_state;
+	struct pll_28nm_raw_state *r = &pll_28nm->raw;
 	void __iomem *base = pll_28nm->phy->pll_base;
 	int ret;
+
+	/*
+	 * W1A (v5): with the raw handoff config captured, reprogram the
+	 * PLL verbatim - lk2nd's proven seeds - instead of recomputing
+	 * them through clk_set_rate() (whose math produces a different,
+	 * HS-breaking configuration on this panel/PHY).
+	 */
+	if (r->captured) {
+		writel(r->refclk, base + 0x00);
+		writel(r->postdiv1, base + 0x04);
+		writel(r->vreg, base + 0x10);
+		writel(r->postdiv3, base + 0x28);
+		writel(r->sdm0, base + 0x38);
+		writel(r->sdm1, base + 0x3c);
+		writel(r->sdm2, base + 0x40);
+		writel(r->sdm3, base + 0x44);
+		writel(r->sdm4, base + 0x48);
+		writel(r->cal_cfg0, base + 0x6c);
+		writel(r->cal_cfg1, base + 0x70);
+		DRM_DEV_INFO(&pll_28nm->phy->pdev->dev,
+			     "MDP3DBG pll restore: raw lk2nd config rewritten\n");
+		return 0;
+	}
+
+	/*
+	 * W1A (noinherit): a never-saved cached state is all zeroes.
+	 * Restoring it calls dsi_pll_28nm_clk_set_rate(0) - which writes
+	 * divider/SDM garbage over the RUNNING bootloader-locked PLL - and
+	 * programs zero post-dividers.  The subsequent link-clk set_rate +
+	 * VCO prepare then has to relock through the wreckage while the
+	 * byte0/pclk0 RCG parent switch races the relock ("rcg didn't
+	 * update its configuration").  A real saved state always has a
+	 * nonzero vco_rate and postdividers; skip the all-zero one.
+	 */
+	if (!cached_state->vco_rate && !cached_state->postdiv3 &&
+	    !cached_state->postdiv1 && !cached_state->byte_mux) {
+		DRM_DEV_INFO(&pll_28nm->phy->pdev->dev,
+			     "MDP3DBG pll restore: skipped (no saved state - PLL left as lk2nd handed it over)\n");
+		return 0;
+	}
 
 	ret = dsi_pll_28nm_clk_set_rate(phy->vco_hw,
 					cached_state->vco_rate, 0);
@@ -719,6 +902,42 @@ static int dsi_pll_28nm_init(struct msm_dsi_phy *phy)
 		return -ENOMEM;
 
 	pll_28nm->phy = phy;
+
+	/*
+	 * W1A (v6): capture lk2nd's raw PLL configuration HERE, at probe,
+	 * before any clk_set_rate()/phy-enable path can rewrite it.  The
+	 * mainline set_rate() seed math produces a functionally different
+	 * configuration than lk2nd's proven one (sdm1 0x4e vs 0x0e,
+	 * postdiv3 0x11 vs 0x2f) - LP commands keep working but the HS
+	 * data path dies (black screen, v2-v4).  With the raw config
+	 * stashed, dsi_pll_28nm_clk_set_rate() below becomes a no-op and
+	 * the restore path rewrites these registers verbatim after a real
+	 * power cycle.
+	 */
+	if (pll_28nm_poll_for_ready(pll_28nm, POLL_MAX_READS, POLL_TIMEOUT_US)) {
+		struct pll_28nm_raw_state *r = &pll_28nm->raw;
+		void __iomem *b = pll_28nm->phy->pll_base;
+
+		r->refclk = readl(b + 0x00);
+		r->postdiv1 = readl(b + 0x04);
+		r->vreg = readl(b + 0x10);
+		r->postdiv3 = readl(b + 0x28);
+		r->sdm0 = readl(b + 0x38);
+		r->sdm1 = readl(b + 0x3c);
+		r->sdm2 = readl(b + 0x40);
+		r->sdm3 = readl(b + 0x44);
+		r->sdm4 = readl(b + 0x48);
+		r->cal_cfg0 = readl(b + 0x6c);
+		r->cal_cfg1 = readl(b + 0x70);
+		r->captured = true;
+		dev_info(&pdev->dev,
+			 "MDP3DBG pll handoff captured at probe: refclk=%02x postdiv1=%02x postdiv3=%02x sdm=%02x %02x %02x %02x %02x cal=%02x %02x\n",
+			 r->refclk, r->postdiv1, r->postdiv3,
+			 r->sdm0, r->sdm1, r->sdm2, r->sdm3, r->sdm4,
+			 r->cal_cfg0, r->cal_cfg1);
+	} else {
+		dev_info(&pdev->dev, "MDP3DBG pll not locked at probe, no handoff capture\n");
+	}
 
 	ret = pll_28nm_register(pll_28nm, phy->provided_clocks->hws);
 	if (ret) {

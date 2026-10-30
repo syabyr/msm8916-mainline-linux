@@ -96,11 +96,22 @@ void mdp3_crtc_kick(struct drm_crtc *crtc)
 			     readl(mdp3_kms->dsi_ctrl + REG_DSI_CMD_MODE_MDP_SW_TRIGGER),
 			     readl(mdp3_kms->dsi_ctrl + REG_DSI_TRIG_CTRL));
 		w1a_mb("kick: first");
+		/* noinherit forensics: capture the full DSI + MDP3 register
+		 * state right before the first frame fetch, for a line-by-line
+		 * diff against the "lk2nd" handoff dump from the same boot */
+		mdp3_dsi_raw_dump(mdp3_kms, "live");
+		mdp3_kms_dump(mdp3_kms, "live");
 	}
 
+	/* v6: mailbox markers around the actual kick MMIO - the first
+	 * commit chain runs under console_lock so printk is unreliable */
+	w1a_mb("kick: DMA_P_START write next");
 	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
-	if (w1a_swtrigger)
+	if (w1a_swtrigger) {
+		w1a_mb("kick: DSI sw trigger next");
 		mdp3_dsi_trigger(mdp3_kms);
+	}
+	w1a_mb("kick: done");
 }
 
 /* if file!=NULL, this is preclose potential cancel-flip path */

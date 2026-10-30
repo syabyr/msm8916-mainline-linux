@@ -45,6 +45,10 @@ extern const struct msm_dsi_phy_cfg dsi_phy_28nm_lp_cfgs;
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_8226_cfgs;
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_8937_cfgs;
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_8909_cfgs;
+/* W1A: rewrite the captured lk2nd PLL config (dsi_phy_28nm.c) after
+ * the clk framework has done its divider programming - see the v9
+ * comment in msm_dsi_phy_pll_write_raw() */
+void msm_dsi_phy_pll_write_raw(struct msm_dsi_phy *phy);
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_8960_cfgs;
 extern const struct msm_dsi_phy_cfg dsi_phy_20nm_cfgs;
 extern const struct msm_dsi_phy_cfg dsi_phy_14nm_cfgs;
