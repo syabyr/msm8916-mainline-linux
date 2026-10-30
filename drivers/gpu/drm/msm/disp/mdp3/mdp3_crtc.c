@@ -155,6 +155,25 @@ static void mdp3_crtc_atomic_disable(struct drm_crtc *crtc,
 	if (WARN_ON(!mdp3_crtc->enabled))
 		return;
 
+	/*
+	 * W1A (v51): stop the frame stream BEFORE the panel sleeps.  With
+	 * the DSI kept alive (v50) the MDP3 autorefresh keeps pushing
+	 * frames into the DSI while the blanked panel produces no TE - the
+	 * command-mode MDP stream then parks waiting for a TE edge that no
+	 * longer comes and stays busy forever (v50 3rd cycle: wake enables
+	 * the panel, but CMD_MODE_MDP_BUSY never clears, no DMA_P_DONE,
+	 * white screen).  Disarm the source here (this runs in the modeset
+	 * disable phase, before the panel bridge disables the panel) and
+	 * let the 2nd-commit takeover re-arm it after the next enable.
+	 */
+	{
+		struct mdp3_kms *kms = get_kms(crtc);
+
+		mdp3_write(kms, REG_MDP3_AUTOREFRESH_CONFIG_P, 0);
+		kms->autorefresh_taken = false;
+		kms->commit_count = 0;
+	}
+
 	/* Disable/save vblank irq handling before power is disabled */
 	drm_crtc_vblank_off(crtc);
 
