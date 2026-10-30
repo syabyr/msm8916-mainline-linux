@@ -221,6 +221,24 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 		return ret;
 	}
 
+	/*
+	 * W1A (v40 diagnostic): read the panel's power-mode register back.
+	 * Boot (inherit, known-good link) and the DPMS re-enable (suspect
+	 * link) both print this; comparing the two tells us whether the
+	 * panel actually receives commands and answers BTA reads after a
+	 * power cycle, or whether everything is silently going into a dead
+	 * PHY (which would explain CMD_MODE_MDP_BUSY stuck forever with no
+	 * TE and no DMA_P_DONE).
+	 */
+	{
+		u8 pm = 0xff;
+		int r = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE,
+					  &pm, 1);
+
+		dev_info(dev, "MDP3DBG panel power-mode readback: ret=%d pm=0x%02x\n",
+			 r, pm);
+	}
+
 	dev_info(dev, "MDP3DBG panel enabled\n");
 	w1a_mb("panel enabled");
 

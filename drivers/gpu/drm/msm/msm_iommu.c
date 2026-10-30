@@ -720,6 +720,8 @@ int msm_iommu_map_page_ident(struct msm_mmu *mmu, phys_addr_t pa, size_t size)
 	 * boot CPU by calling the domain's map_pages op directly) */
 	ret = iommu_map(iommu->domain, (unsigned long)pa, pa, size,
 			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret == -EEXIST)
+		return 0;	/* already identity-mapped (re-enable path) */
 	if (ret) {
 		pr_err("MDP3DBG ident map %pa failed: %zd\n", &pa, ret);
 		return ret;

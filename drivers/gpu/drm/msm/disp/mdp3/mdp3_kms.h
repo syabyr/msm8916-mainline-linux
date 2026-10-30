@@ -76,6 +76,20 @@ static inline u32 vbif_read(struct mdp3_kms *mdp3_kms, u32 reg)
 
 static inline void mdp3_dsi_trigger(struct mdp3_kms *mdp3_kms)
 {
+	/*
+	 * W1A (v39): force the DSI clock lane into HS before triggering the
+	 * MDP stream, exactly as the 3.18 stock driver does for kicks
+	 * (mdss_dsi_start_hs_clk_lane in the from_mdp path).  After a
+	 * display power cycle the lane sits in LP stop; without the force
+	 * the MDP stream never transmits and CMD_MODE_MDP_BUSY stays set
+	 * forever (v38 wake: dsi_status0 bit2 stuck, no TE, no
+	 * DMA_P_DONE -> black screen).  Boot worked only because lk2nd
+	 * handed over a running HS clock lane.  The bit stays set while
+	 * the panel is enabled (autorefresh streams continuously); the
+	 * command path releases/re-forces it per transfer.
+	 */
+	writel(readl(mdp3_kms->dsi_ctrl + REG_DSI_LANE_CTRL) | BIT(28),
+	       mdp3_kms->dsi_ctrl + REG_DSI_LANE_CTRL);
 	writel(1, mdp3_kms->dsi_ctrl + REG_DSI_CMD_MODE_MDP_SW_TRIGGER);
 }
 
@@ -84,6 +98,10 @@ struct drm_crtc *mdp3_crtc_init(struct drm_device *dev, struct drm_plane *plane)
 struct drm_encoder *mdp3_dsi_encoder_init(struct drm_device *dev);
 
 void mdp3_crtc_kick(struct drm_crtc *crtc);
+/* W1A (v49): re-run the MDP3 display-on programming after a DPMS wake */
+void mdp3_w1a_reinit_stream(struct mdp3_kms *mdp3_kms);
+extern bool w1a_dsi_pa_active;
+extern bool w1a_reinit_done;
 void mdp3_crtc_wait_for_flush_done(struct drm_crtc *crtc);
 
 void mdp3_kms_dump(struct mdp3_kms *mdp3_kms, const char *tag);

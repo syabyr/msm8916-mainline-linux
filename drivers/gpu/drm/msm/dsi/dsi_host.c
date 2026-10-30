@@ -129,6 +129,26 @@ static int __init w1a_no_cmdpoll_setup(char *s)
 }
 __setup("w1a.no_cmdpoll", w1a_no_cmdpoll_setup);
 
+/* W1A (v46): re-enable dsi_sw_reset on the re-enable path (see the
+ * comment at the call site). */
+static bool w1a_re_enable_swreset = true;
+static int __init w1a_no_re_swreset_setup(char *s)
+{
+	w1a_re_enable_swreset = false;
+	return 1;
+}
+__setup("w1a.no_re_swreset", w1a_no_re_swreset_setup);
+
+/* W1A (v50): leave the DSI host/PHY powered across DPMS off - only the
+ * panel sleeps.  See the comment in msm_dsi_host_power_off(). */
+bool w1a_dsi_keepalive = true;
+static int __init w1a_no_dsi_keepalive_setup(char *s)
+{
+	w1a_dsi_keepalive = false;
+	return 1;
+}
+__setup("w1a.no_dsi_keepalive", w1a_no_dsi_keepalive_setup);
+
 /* W1A (v23): keep the link clocks enabled between panel commands (see
  * the comment in msm_dsi_host_xfer_restore()).  "w1a.no_clkhold"
  * restores the per-command disable for A/B testing. */
@@ -3327,6 +3347,39 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			w1a_dsi_pa_active = true;
 			pr_info("MDP3DBG tx buf: fixed lk2nd page 0x08f68f000 for re-enable (va=%px)\n",
 				msm_host->tx_buf);
+
+			/*
+			 * W1A (v37): attach the display domain and map the
+			 * page HERE - the panel's init commands run in the
+			 * same commit, BEFORE the next enable_commit would
+			 * have done it (v36: fault at 96.59s, ident map at
+			 * 97.85s - one commit too late).  mdp3_enable_commit
+			 * sits at the START of the commit tail; pre_enable
+			 * (this function) and the panel commands follow it.
+			 */
+			if (msm_host->dev) {
+				struct msm_drm_private *priv =
+					msm_host->dev->dev_private;
+
+				if (priv && priv->kms && priv->kms->vm) {
+					struct msm_mmu *mmu =
+						to_msm_vm(priv->kms->vm)->mmu;
+
+					/*
+					 * W1A (v41): identity map ONLY - no
+					 * detach/attach.  v37/v38 re-attached
+					 * the domain here, which left the
+					 * MDP3 frame stream wedged after wake
+					 * (CMD_MODE_MDP_BUSY stuck, no
+					 * DMA_P_DONE) while commands and BTA
+					 * reads worked.  The domain stays
+					 * attached for the driver lifetime;
+					 * the tx page just needs a mapping.
+					 */
+					msm_iommu_map_page_ident(mmu,
+							0x08f68f000, SZ_4K);
+				}
+			}
 		} else {
 			pr_err("MDP3DBG lk2nd page mapping failed\n");
 		}
@@ -3366,7 +3419,7 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	w1a_step("after timing_setup", msm_host);
 	pr_info("MDP3DBG dsi timing_setup done, sw_reset\n");
 	w1a_mb("dsi timing done, sw_reset next");
-	if (w1a_dsi_boot_inherit_done) {
+	if (w1a_dsi_boot_inherit_done && !w1a_re_enable_swreset) {
 		/*
 		 * W1A (v30): skip the DSI controller soft reset on the
 		 * re-enable path.  The reset runs AFTER the PHY has been
@@ -3382,6 +3435,13 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		 */
 		pr_info("MDP3DBG dsi sw_reset SKIPPED (re-enable path)\n");
 	} else {
+		/* W1A (v46): re-enabled by default again.  The skip left the
+		 * DSI's command-mode MDP state machine with a stale busy
+		 * state after CTRL=0 at blank: TE flowed, all stream
+		 * registers matched boot, yet CMD_MODE_MDP_BUSY never
+		 * cleared and DMA_P_DONE never fired (white panel).  With
+		 * the PLL raw-seed restore now in place the reset no longer
+		 * wedges the link.  "w1a.no_re_swreset" restores v30. */
 		dsi_sw_reset(msm_host);
 	}
 	w1a_step("after sw_reset", msm_host);
@@ -3413,6 +3473,23 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+
+	/*
+	 * W1A (v50): keep the DSI host/PHY/PLL powered across a DPMS off.
+	 * Every reconstruction attempt after a real power cycle (v2-v49,
+	 * 40+ builds) leaves the command-mode MDP stream wedged: the panel
+	 * initialises fine (LP commands + BTA reads OK), TE flows, every
+	 * DSI register matches the boot handoff - yet CMD_MODE_MDP_BUSY
+	 * never clears and no frame reaches the panel (white screen).
+	 * The blank path only needs the PANEL to go to sleep (display off
+	 * + sleep-in, done by the panel bridge); the DSI link can stay up
+	 * like lk2nd leaves it.  "w1a.no_dsi_keepalive" restores the full
+	 * teardown for A/B.
+	 */
+	if (w1a_dsi_keepalive) {
+		w1a_mb("power_off: keepalive - DSI left powered");
+		return 0;
+	}
 
 	mutex_lock(&msm_host->dev_mutex);
 	if (!msm_host->power_on) {

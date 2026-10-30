@@ -213,8 +213,14 @@ static void dsi_mgr_phy_disable(int id)
 
 /* v10 hybrid: skip the disable that pairs with a skipped enable (see
  * the comment at the w1a_phy_skipped declaration). */
+/* W1A (v36): set by the dsi host when the tx buffer moved to the raw-PA
+ * path; gates the SMMU re-attach + identity map below */
+extern bool w1a_dsi_keepalive;
+
 static void w1a_maybe_phy_disable(int id)
 {
+	if (w1a_dsi_keepalive)
+		return;
 	if (w1a_phy_skipped) {
 		w1a_phy_skipped = false;
 		return;

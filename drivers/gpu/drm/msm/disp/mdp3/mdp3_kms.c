@@ -183,6 +183,49 @@ none:
 /* W1A (v36): set by the dsi host when the tx buffer moved to the raw-PA
  * path; gates the SMMU re-attach + identity map below */
 extern bool w1a_dsi_pa_active;
+bool w1a_reinit_done;
+
+/*
+ * W1A (v49): replay the display-on-critical MDP3 programming after a
+ * DPMS wake.  Diagnostic evidence: after wake the panel is on (DCS
+ * power-mode read 0x9c), TE flows (SYNC_PRIMARY_LINE interrupts at
+ * ~25/s), every DSI controller register matches the boot handoff dump,
+ * CB4 shows no fault - yet CMD_MODE_MDP_BUSY stays set and DMA_P_DONE
+ * never fires (white panel).  The only subsystem not reprogrammed since
+ * boot is the MDP3 side: CGC/VBIF gates, the tear-check block and the
+ * DSI_CMD id-map/trigger routing.  Redo them here, before the first
+ * frame fetch of the new session.
+ */
+void mdp3_w1a_reinit_stream(struct mdp3_kms *mdp3_kms)
+{
+	u32 cfg = (0x7ff << 21) | BIT(19) | BIT(20) | 733;
+
+	pm_runtime_get_sync(mdp3_kms->dev->dev);
+
+	mdp3_write(mdp3_kms, REG_MDP3_CGC_EN,
+		   mdp3_read(mdp3_kms, REG_MDP3_CGC_EN) & ~(BIT(10) | BIT(18)));
+	vbif_write(mdp3_kms, REG_MDP3_VBIF_FORCE_EN, 0x3);
+
+	mdp3_write(mdp3_kms, REG_MDP3_DSI_CMD_MODE_ID_MAP, 0x10);
+	mdp3_write(mdp3_kms, REG_MDP3_DSI_CMD_MODE_TRIGGER_EN, 0x11);
+
+	mdp3_write(mdp3_kms, REG_MDP3_SYNC_CONFIG_0, cfg);
+	mdp3_write(mdp3_kms, REG_MDP3_VSYNC_SEL, 0x024);
+	mdp3_write(mdp3_kms, REG_MDP3_PRIMARY_VSYNC_INIT_VAL, 400);
+	mdp3_write(mdp3_kms, REG_MDP3_PRIMARY_RD_PTR_IRQ, 401);
+	mdp3_write(mdp3_kms, REG_MDP3_SYNC_THRESH_0, (4 << 16) | 4);
+	mdp3_write(mdp3_kms, REG_MDP3_PRIMARY_START_POS, 400);
+	mdp3_write(mdp3_kms, REG_MDP3_TEAR_CHECK_EN, 1);
+
+	pr_info("MDP3DBG wake reinit: CGC=%08x VBIF=%08x idmap=%08x trigen=%08x tc=%08x\n",
+		mdp3_read(mdp3_kms, REG_MDP3_CGC_EN),
+		vbif_read(mdp3_kms, REG_MDP3_VBIF_FORCE_EN),
+		mdp3_read(mdp3_kms, REG_MDP3_DSI_CMD_MODE_ID_MAP),
+		mdp3_read(mdp3_kms, REG_MDP3_DSI_CMD_MODE_TRIGGER_EN),
+		mdp3_read(mdp3_kms, REG_MDP3_TEAR_CHECK_EN));
+
+	pm_runtime_put_sync(mdp3_kms->dev->dev);
+}
 
 /* safe from any context, incl. atomic and while console_lock is held */
 __printf(1, 2)
@@ -640,19 +683,15 @@ static void mdp3_enable_commit(struct msm_kms *kms)
 	 * re-enable.  Cheap no-op when the domain is already live.
 	 */
 	if (w1a_dsi_pa_active && kms->vm) {
-		struct msm_mmu *mmu = to_msm_vm(kms->vm)->mmu;
-
-		msm_iommu_reattach(mmu);
 		/*
-		 * v35: identity-map the raw-PA DSI command buffer page -
-		 * after the re-attach the port is in translated mode and
-		 * the fetch from 0x8f68f000 faulted (v34: CB4 fsr=40000202,
-		 * far=8f68f000).  Map it so raw-PA fetches translate.
-		 * v36: only on the raw-PA path - doing this at boot (GEM
-		 * path) hung the first commit (mailbox died at the
-		 * enable_commit marker).
+		 * v38: nothing here.  v36 did the re-attach + identity map
+		 * in this hook, but it runs on EVERY commit: the
+		 * detach/attach cycle disrupted in-flight fetches (vblank
+		 * timeouts) and the map repeated with -EEXIST.  Both are
+		 * done once, at the right moment, in
+		 * msm_dsi_host_power_on() when the tx buffer switches to
+		 * the raw-PA page - before the panel init commands run.
 		 */
-		msm_iommu_map_page_ident(mmu, 0x08f68f000, SZ_4K);
 	}
 }
 
