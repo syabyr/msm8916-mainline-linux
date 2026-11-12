@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/regulator/consumer.h>
-extern void w1a_mb(const char *fmt, ...); /* W1A mailbox */
 
 #include <video/mipi_display.h>
 
@@ -126,9 +125,6 @@ static int rm67162_panel_prepare(struct drm_panel *panel)
 	struct rm67162_panel *ctx = to_rm67162_panel(panel);
 	int ret;
 
-	dev_info(&ctx->dsi->dev, "MDP3DBG panel prepare\n");
-	w1a_mb("panel prepare (reset+init cmds next)");
-
 	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
 	if (ret)
 		return ret;
@@ -144,8 +140,6 @@ static int rm67162_panel_prepare(struct drm_panel *panel)
 	msleep(20);
 
 	ctx->prepared = true;
-
-	dev_info(&ctx->dsi->dev, "MDP3DBG panel prepared\n");
 
 	return 0;
 }
@@ -174,19 +168,15 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
-	dev_info(dev, "MDP3DBG panel enable: sending init seq\n");
-	w1a_mb("panel enable: init seq next");
-
 	/*
-	 * W1A (v21): sacrificial first transfer.  The forensic step trace
-	 * (v20) shows the FIRST command after the full re-enable path
-	 * fetches while the byte clock domain is still settling: HS FIFO
-	 * underflow + DSICLK domain glitch on exactly that transfer, all
-	 * subsequent transfers healthy.  That first transfer was the 0xFE
-	 * page select - failing it aborted the whole init sequence (black
-	 * screen after DPMS wake).  Send a harmless page-0 select first
-	 * and ignore its result; the real init sequence then starts on a
-	 * warmed-up engine.
+	 * Sacrificial first transfer.  The first command after the full
+	 * re-enable path fetches while the byte clock domain is still
+	 * settling (HS FIFO underflow + DSICLK glitch on exactly that
+	 * transfer, all subsequent transfers healthy).  That first transfer
+	 * was the 0xFE page select - failing it aborted the whole init
+	 * sequence (black screen after DPMS wake).  Send a harmless page-0
+	 * select first and ignore its result; the real init sequence then
+	 * starts on a warmed-up engine.
 	 */
 	rm67162_write(dsi, WRMAUCCTR, 0x00);
 	msleep(20);
@@ -196,9 +186,6 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 		dev_err(dev, "Failed to send vendor commands (%d)\n", ret);
 		return ret;
 	}
-
-	dev_info(dev, "MDP3DBG panel enable: init seq done, tear on\n");
-	w1a_mb("panel enable: init seq done");
 
 	/* tear on, sourced from the TE pin (DCS 0x35 0x00) */
 	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
@@ -220,27 +207,6 @@ static int rm67162_panel_enable(struct drm_panel *panel)
 		dev_err(dev, "Failed to set display ON (%d)\n", ret);
 		return ret;
 	}
-
-	/*
-	 * W1A (v40 diagnostic): read the panel's power-mode register back.
-	 * Boot (inherit, known-good link) and the DPMS re-enable (suspect
-	 * link) both print this; comparing the two tells us whether the
-	 * panel actually receives commands and answers BTA reads after a
-	 * power cycle, or whether everything is silently going into a dead
-	 * PHY (which would explain CMD_MODE_MDP_BUSY stuck forever with no
-	 * TE and no DMA_P_DONE).
-	 */
-	{
-		u8 pm = 0xff;
-		int r = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE,
-					  &pm, 1);
-
-		dev_info(dev, "MDP3DBG panel power-mode readback: ret=%d pm=0x%02x\n",
-			 r, pm);
-	}
-
-	dev_info(dev, "MDP3DBG panel enabled\n");
-	w1a_mb("panel enabled");
 
 	return 0;
 }

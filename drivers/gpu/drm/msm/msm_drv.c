@@ -273,19 +273,9 @@ static int msm_open(struct drm_device *dev, struct drm_file *file)
 	 */
 	load_gpu(dev);
 
-	/* W1A bring-up: bracket the fbdev client's GEM allocation (which
-	 * starts right after this open returns) - the first M2 black-screen
-	 * boot froze somewhere in here with the threaded printk losing the
-	 * tail, so pin this marker down before anything heavy runs. */
-	pr_info("MDP3DBG msm_open: gpu load done\n");
-	pr_flush(1000, true);
-
 	ret = context_init(dev, file);
 	if (ret)
 		return ret;
-
-	pr_info("MDP3DBG msm_open: context_init done, returning\n");
-	pr_flush(1000, true);
 
 	return 0;
 }

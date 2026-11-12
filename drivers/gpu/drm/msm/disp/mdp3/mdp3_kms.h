@@ -25,12 +25,6 @@ struct mdp3_kms {
 	/* DSI ctrl reg space for the command-mode MDP trigger; mapped
 	 * without requesting the region, the msm dsi host owns it */
 	void __iomem *dsi_ctrl;
-	/* DSI PHY (0x1ac8500) + PLL (0x1ac8300) + GCC (0x1800000) windows
-	 * for the bring-up register dumps - read-only, owned by their
-	 * drivers */
-	void __iomem *dsi_phy;
-	void __iomem *dsi_pll;
-	void __iomem *gcc_base;
 
 	/* m4a: commit counter + takeover flag - autorefresh is disarmed at
 	 * the SECOND flush_commit (first frame with our config completed,
@@ -98,14 +92,6 @@ struct drm_crtc *mdp3_crtc_init(struct drm_device *dev, struct drm_plane *plane)
 struct drm_encoder *mdp3_dsi_encoder_init(struct drm_device *dev);
 
 void mdp3_crtc_kick(struct drm_crtc *crtc);
-/* W1A (v49): re-run the MDP3 display-on programming after a DPMS wake */
-void mdp3_w1a_reinit_stream(struct mdp3_kms *mdp3_kms);
-extern bool w1a_dsi_pa_active;
-extern bool w1a_reinit_done;
 void mdp3_crtc_wait_for_flush_done(struct drm_crtc *crtc);
-
-void mdp3_kms_dump(struct mdp3_kms *mdp3_kms, const char *tag);
-void mdp3_dsi_raw_dump(struct mdp3_kms *mdp3_kms, const char *tag);
-void w1a_mb(const char *fmt, ...);    /* W1A ramoops mailbox trace */
 
 #endif /* __MDP3_KMS_H__ */

@@ -699,15 +699,8 @@ int msm_gem_dumb_create(struct drm_file *file, struct drm_device *dev,
 	if (ret)
 		return ret;
 
-	pr_info("MDP3DBG dumb_create: %ux%u size=%llu, gem alloc next\n",
-		args->width, args->height, args->size);
-	pr_flush(1000, true);
-
 	ret = msm_gem_new_handle(dev, file, args->size,
 			MSM_BO_SCANOUT | MSM_BO_WC, &args->handle, "dumb");
-	pr_info("MDP3DBG dumb_create: gem alloc ret=%d handle=%u\n",
-		ret, args->handle);
-	pr_flush(1000, true);
 	return ret;
 }
 

@@ -34,9 +34,6 @@ static int __init mdp3_nokick_setup(char *s)
 }
 __setup("w1a.nokick", mdp3_nokick_setup);
 
-/* m3j: first-kick-only marker (see mdp3_crtc_kick) */
-static unsigned int kick_count;
-
 /* m4b: runtime switch for the DSI MDP_SW_TRIGGER poke.  The poke is a
  * belt-and-braces leftover from bring-up - downstream mdp3 NEVER writes
  * that register (the DSI-side trigger is routed by ID_MAP/TRIGGER_EN,
@@ -74,56 +71,12 @@ void mdp3_crtc_kick(struct drm_crtc *crtc)
 {
 	struct mdp3_kms *mdp3_kms = get_kms(crtc);
 
-	/* Markers are BARE pr_info on purpose: the first atomic commit runs
-	 * under console_lock (fbcon takeover), and pr_flush() takes
-	 * console_lock internally - a pr_flush() here would deadlock the
-	 * machine (this is exactly what killed M2 boots v3..v7).  The
-	 * W1A watchdog panic replay is what makes these visible if the
-	 * commit hangs. */
-	if (mdp3_nokick) {
-		DRM_DEV_INFO(crtc->dev->dev, "MDP3DBG kick: SKIPPED (w1a.nokick)");
-		w1a_mb("kick SKIPPED (nokick)");
+	if (mdp3_nokick)
 		return;
-	}
 
-	/* m3j: per-kick markers removed (13 lines/frame at 30fps drowned
-	 * dmesg).  The pre-start/trig reads only ever served the bring-up
-	 * bisects; keep one first-kick-only line as pipe-alive evidence. */
-	if (!kick_count++) {
-		DRM_DEV_INFO(crtc->dev->dev,
-			     "MDP3DBG kick: first (start=%08x trig=%08x trigctrl=%08x)",
-			     mdp3_read(mdp3_kms, REG_MDP3_DMA_P_START),
-			     readl(mdp3_kms->dsi_ctrl + REG_DSI_CMD_MODE_MDP_SW_TRIGGER),
-			     readl(mdp3_kms->dsi_ctrl + REG_DSI_TRIG_CTRL));
-		w1a_mb("kick: first");
-		/* noinherit forensics: capture the full DSI + MDP3 register
-		 * state right before the first frame fetch, for a line-by-line
-		 * diff against the "lk2nd" handoff dump from the same boot */
-		mdp3_dsi_raw_dump(mdp3_kms, "live");
-		mdp3_kms_dump(mdp3_kms, "live");
-	}
-
-	/* v6: mailbox markers around the actual kick MMIO - the first
-	 * commit chain runs under console_lock so printk is unreliable */
-	w1a_mb("kick: DMA_P_START write next");
-	/*
-	 * W1A (v49): on the first kick after a display power cycle,
-	 * re-run the MDP3-side display-on programming (CGC/VBIF/tear-check/
-	 * DSI routing).  All DSI registers match boot and TE flows, yet
-	 * CMD_MODE_MDP_BUSY never clears and DMA_P_DONE never fires - the
-	 * MDP3 stream state left stale by the blank path is the remaining
-	 * difference from the working boot.
-	 */
-	if (!w1a_reinit_done && w1a_dsi_pa_active) {
-		w1a_reinit_done = true;
-		mdp3_w1a_reinit_stream(mdp3_kms);
-	}
 	mdp3_write(mdp3_kms, REG_MDP3_DMA_P_START, 1);
-	if (w1a_swtrigger) {
-		w1a_mb("kick: DSI sw trigger next");
+	if (w1a_swtrigger)
 		mdp3_dsi_trigger(mdp3_kms);
-	}
-	w1a_mb("kick: done");
 }
 
 /* if file!=NULL, this is preclose potential cancel-flip path */
@@ -192,8 +145,6 @@ static void mdp3_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_state *state)
 {
 	struct mdp3_crtc *mdp3_crtc = to_mdp3_crtc(crtc);
-
-	DRM_DEV_INFO(crtc->dev->dev, "MDP3DBG crtc atomic_enable");
 
 	if (WARN_ON(mdp3_crtc->enabled))
 		return;
@@ -287,93 +238,8 @@ void mdp3_crtc_wait_for_flush_done(struct drm_crtc *crtc)
 
 	ret = wait_event_timeout(*queue, !mdp3_crtc->event,
 				 msecs_to_jiffies(50));
-	if (ret <= 0) {
-		struct mdp3_kms *kms = get_kms(crtc);
-
-		dev_warn(crtc->dev->dev, "MDP3DBG vblank timeout\n");
-		w1a_mb("wait_for_flush_done: TIMEOUT (no DMA_P_DONE)");
-		/* m2y (M3): discriminate WHY DMA_P_DONE never dispatches:
-		 *  (a) fetch wedged: DMA_P_START still set (never consumed)
-		 *  (b) fetch done + IRQ masked: INTR_STATUS has BIT14 latched
-		 *      while INTR_ENABLE lacks it
-		 *  (c) GIC 72 dead: status clean, enable armed, start clear
-		 * Also AUTOREFRESH (lk2nd left it armed; it re-fetches on its
-		 * own 12fps schedule and its done is BIT25, not BIT14) and the
-		 * DSI-side state (cmd-mode MDP engine busy?).
-		 */
-		dev_warn(crtc->dev->dev,
-			 "MDP3DBG vblank TO dump: start=%08x intr_en=%08x intr_st=%08x autorefresh=%08x\n",
-			 mdp3_read(kms, REG_MDP3_DMA_P_START),
-			 mdp3_read(kms, REG_MDP3_INTR_ENABLE),
-			 mdp3_read(kms, REG_MDP3_INTR_STATUS),
-			 mdp3_read(kms, REG_MDP3_AUTOREFRESH_CONFIG_P));
-		dev_warn(crtc->dev->dev,
-			 "MDP3DBG vblank TO dump2: dsi_ctrl=%08x dsi_status0=%08x dsi_fifo=%08x\n",
-			 readl(kms->dsi_ctrl),
-			 readl(kms->dsi_ctrl + 0x04),
-			 readl(kms->dsi_ctrl + 0x08));
-		/* W1A (v42): the scanout source.  If IBUF is stale/unmapped
-		 * after a DPMS cycle, the MDP fetch hangs while the engine
-		 * reads healthy - exactly the CMD_MODE_MDP_BUSY-stuck
-		 * signature.
-		 */
-		dev_warn(crtc->dev->dev,
-			 "MDP3DBG vblank TO dump3: dma_p cfg=%08x size=%08x ibuf=%08x stride=%08x xy=%08x\n",
-			 mdp3_read(kms, REG_MDP3_DMA_P_CONFIG),
-			 mdp3_read(kms, REG_MDP3_DMA_P_SIZE),
-			 mdp3_read(kms, REG_MDP3_DMA_P_IBUF_ADDR),
-			 mdp3_read(kms, REG_MDP3_DMA_P_IBUF_Y_STRIDE),
-			 mdp3_read(kms, REG_MDP3_DMA_P_OUT_XY));
-		/* W1A (v43): tear-check block state.  TE never arriving can
-		 * mean this block lost its config (or its vsync clock) across
-		 * the DPMS cycle - the same block also gates DMA_P_DONE
-		 * completion in downstream's design. */
-		dev_warn(crtc->dev->dev,
-			 "MDP3DBG vblank TO dump4: sync_cfg=%08x vsync_sel=%08x tc_en=%08x startpos=%08x rdptr=%08x sync_st2=%08x\n",
-			 mdp3_read(kms, REG_MDP3_SYNC_CONFIG_0),
-			 mdp3_read(kms, REG_MDP3_VSYNC_SEL),
-			 mdp3_read(kms, REG_MDP3_TEAR_CHECK_EN),
-			 mdp3_read(kms, REG_MDP3_PRIMARY_START_POS),
-			 mdp3_read(kms, REG_MDP3_PRIMARY_RD_PTR_IRQ),
-			 mdp3_read(kms, REG_MDP3_SYNC_STATUS_2));
-		/* W1A (v45): DSI MDP-stream registers - compare against the
-		 * boot "lk2nd dsi" dump (dma_ctrl=14000000, mdpctl2=00010006,
-		 * str0ctl=04b10039, str0tot=01900190, trig=4). */
-		dev_warn(crtc->dev->dev,
-			 "MDP3DBG vblank TO dump5: dma_ctrl=%08x mdpctl2=%08x str0ctl=%08x str0tot=%08x trig=%08x ctrl=%08x lane=%08x\n",
-			 readl(kms->dsi_ctrl + 0x03c),
-			 readl(kms->dsi_ctrl + 0x1b8),
-			 readl(kms->dsi_ctrl + 0x058),
-			 readl(kms->dsi_ctrl + 0x05c),
-			 readl(kms->dsi_ctrl + 0x084),
-			 readl(kms->dsi_ctrl + 0x004),
-			 readl(kms->dsi_ctrl + 0x0ac));
-		/* W1A (v47): CB4 fault check for the SCANOUT fetch.  The
-		 * cmd path already proved translations matter (v34: CB4
-		 * fault far=tx PA).  If the frame fetch from the fb iova
-		 * faults silently, this latches fsr bit31 + far.
-		 * Read-only, one-shot. */
-		{
-			static bool cb4_probed;
-
-			if (!cb4_probed) {
-				void __iomem *cb4 = ioremap(0x01e24000, 0x100);
-
-				cb4_probed = true;
-				if (cb4) {
-					u32 fsr = readl(cb4 + 0x58);
-					u32 far = readl(cb4 + 0x60);
-					u32 fsynr0 = readl(cb4 + 0x68);
-
-					iounmap(cb4);
-					dev_warn(crtc->dev->dev,
-						 "MDP3DBG vblank TO cb4: fsr=%08x far=%08x fsynr0=%08x%s\n",
-						 fsr, far, fsynr0,
-						 (fsr & BIT(31)) ? " *** FAULT LATCHED ***" : "");
-				}
-			}
-		}
-	}
+	if (ret <= 0)
+		dev_warn(crtc->dev->dev, "MDP3 vblank timeout (no DMA_P_DONE)\n");
 
 	drm_crtc_vblank_put(crtc);
 }

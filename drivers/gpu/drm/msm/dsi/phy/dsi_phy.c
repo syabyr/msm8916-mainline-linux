@@ -668,10 +668,8 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 	/* W1A bring-up bisect: "w1a.nodphy" on the cmdline ignores the
 	 * vendor timing override (behaves like the DT property absent,
 	 * i.e. mainline-calculated timings) without rebuilding the DTB. */
-	if (w1a_nodphy) {
-		dev_info(dev, "MDP3DBG dphy override DISABLED (w1a.nodphy)\n");
+	if (w1a_nodphy)
 		phy->timing_override = false;
-	}
 
 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
 	if (IS_ERR(phy->base))
@@ -802,10 +800,6 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 		shared_timings->clk_pre = phy->clk_pre;
 		shared_timings->clk_post = phy->clk_post;
 	}
-
-	dev_info(dev, "MDP3DBG msm_dsi_phy_enable done: clk_pre=%u clk_post=%u override=%d\n",
-		 shared_timings->clk_pre, shared_timings->clk_post,
-		 phy->timing_override);
 
 	/*
 	 * Resetting DSI PHY silently changes its PLL registers to reset status,

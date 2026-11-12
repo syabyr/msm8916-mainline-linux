@@ -181,8 +181,6 @@ static int dsi_pll_28nm_clk_set_rate(struct clk_hw *hw, unsigned long rate,
 		writel(r->cal_cfg0, base + 0x6c);
 		writel(r->cal_cfg1, base + 0x70);
 		pll_28nm->cached_state.vco_rate = rate;
-		DRM_DEV_INFO(dev, "MDP3DBG pll set_rate(%lu) -> raw lk2nd seeds rewritten\n",
-			     rate);
 		return 0;
 	}
 
@@ -565,13 +563,7 @@ static int dsi_pll_28nm_vco_prepare_lp(struct clk_hw *hw)
 			r->cal_cfg0 = readl(b + 0x6c);
 			r->cal_cfg1 = readl(b + 0x70);
 			r->captured = true;
-			dev_info(dev,
-				 "MDP3DBG pll handoff captured: refclk=%02x postdiv1=%02x postdiv3=%02x sdm=%02x %02x %02x %02x %02x cal=%02x %02x\n",
-				 r->refclk, r->postdiv1, r->postdiv3,
-				 r->sdm0, r->sdm1, r->sdm2, r->sdm3, r->sdm4,
-				 r->cal_cfg0, r->cal_cfg1);
 		}
-		dev_info(dev, "MDP3DBG pll inherit: VCO already locked, skipping reprogram\n");
 		pll_28nm->phy->pll_on = true;
 		return 0;
 	}
@@ -600,7 +592,6 @@ static int dsi_pll_28nm_vco_prepare_lp(struct clk_hw *hw)
 		writel(r->sdm4, base + 0x48);
 		writel(r->cal_cfg0, base + 0x6c);
 		writel(r->cal_cfg1, base + 0x70);
-		dev_info(dev, "MDP3DBG pll prepare: raw seeds rewritten after sw reset\n");
 	}
 
 	/*
@@ -746,9 +737,6 @@ void msm_dsi_phy_pll_write_raw(struct msm_dsi_phy *phy)
 	writel(r->sdm4, base + 0x48);
 	writel(r->cal_cfg0, base + 0x6c);
 	writel(r->cal_cfg1, base + 0x70);
-	DRM_DEV_INFO(&phy->pdev->dev,
-		     "MDP3DBG pll raw config rewritten post-enable (postdiv3=%02x vreg=%02x)\n",
-		     r->postdiv3, r->vreg);
 }
 
 static int dsi_28nm_pll_restore_state(struct msm_dsi_phy *phy)
@@ -777,8 +765,6 @@ static int dsi_28nm_pll_restore_state(struct msm_dsi_phy *phy)
 		writel(r->sdm4, base + 0x48);
 		writel(r->cal_cfg0, base + 0x6c);
 		writel(r->cal_cfg1, base + 0x70);
-		DRM_DEV_INFO(&pll_28nm->phy->pdev->dev,
-			     "MDP3DBG pll restore: raw lk2nd config rewritten\n");
 		return 0;
 	}
 
@@ -793,11 +779,8 @@ static int dsi_28nm_pll_restore_state(struct msm_dsi_phy *phy)
 	 * nonzero vco_rate and postdividers; skip the all-zero one.
 	 */
 	if (!cached_state->vco_rate && !cached_state->postdiv3 &&
-	    !cached_state->postdiv1 && !cached_state->byte_mux) {
-		DRM_DEV_INFO(&pll_28nm->phy->pdev->dev,
-			     "MDP3DBG pll restore: skipped (no saved state - PLL left as lk2nd handed it over)\n");
+	    !cached_state->postdiv1 && !cached_state->byte_mux)
 		return 0;
-	}
 
 	ret = dsi_pll_28nm_clk_set_rate(phy->vco_hw,
 					cached_state->vco_rate, 0);
@@ -930,13 +913,6 @@ static int dsi_pll_28nm_init(struct msm_dsi_phy *phy)
 		r->cal_cfg0 = readl(b + 0x6c);
 		r->cal_cfg1 = readl(b + 0x70);
 		r->captured = true;
-		dev_info(&pdev->dev,
-			 "MDP3DBG pll handoff captured at probe: refclk=%02x postdiv1=%02x postdiv3=%02x sdm=%02x %02x %02x %02x %02x cal=%02x %02x\n",
-			 r->refclk, r->postdiv1, r->postdiv3,
-			 r->sdm0, r->sdm1, r->sdm2, r->sdm3, r->sdm4,
-			 r->cal_cfg0, r->cal_cfg1);
-	} else {
-		dev_info(&pdev->dev, "MDP3DBG pll not locked at probe, no handoff capture\n");
 	}
 
 	ret = pll_28nm_register(pll_28nm, phy->provided_clocks->hws);
@@ -1054,10 +1030,6 @@ static int dsi_28nm_phy_enable(struct msm_dsi_phy *phy,
 			0x00, 0x00, 0xb1, 0xff, 0x00, 0x00
 		};
 
-		dev_info(&phy->pdev->dev,
-			 "MDP3DBG phy vendor enable: start (timing[0]=%08x)\n",
-			 phy->timing_regs[0]);
-
 		writel(0x5b, base + REG_DSI_28nm_PHY_CTRL_0);
 		writel(0xff, base + REG_DSI_28nm_PHY_STRENGTH_0);
 
@@ -1095,8 +1067,6 @@ static int dsi_28nm_phy_enable(struct msm_dsi_phy *phy,
 		for (i = 0; i < 6; i++)
 			writel(bist_ctrl[i],
 			       base + REG_DSI_28nm_PHY_BIST_CTRL_0 + 4 * i);
-
-		dev_info(&phy->pdev->dev, "MDP3DBG phy vendor enable: done\n");
 
 		return 0;
 	}

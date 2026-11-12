@@ -106,14 +106,10 @@
  * this poke is a belt-and-braces kick on top of the implicit one. */
 #define REG_DSI_CMD_MODE_MDP_SW_TRIGGER		0x0094
 
-/* DSI TRIG_CTRL (raw-base offset; absolute 0x1ac8084) - printed by the
- * kick so the dsi_host.c TE-bit fix can be verified from the boot log
- * alone: the value must read 0x00000004 on W1A, not 0x80001004 */
-#define REG_DSI_TRIG_CTRL			0x0084
-
 /* DSI LANE_CTRL (raw-base offset; absolute 0x1ac80b0).  BIT(28) =
  * CLKLN_HS_FORCE_REQUEST, the stock 8909 errata bit that must be set
- * before every MDP stream / command transfer (v39). */
+ * before every MDP stream / command transfer.
+ */
 #define REG_DSI_LANE_CTRL			0x00b0
 
 #endif /* __MDP3_HWIO_H__ */

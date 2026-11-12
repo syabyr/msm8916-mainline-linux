@@ -30,9 +30,6 @@ static void mdp3_dsi_encoder_enable(struct drm_encoder *encoder)
 	struct mdp3_dsi_encoder *mdp3_dsi_encoder = to_mdp3_dsi_encoder(encoder);
 
 	mdp3_dsi_encoder->enabled = true;
-
-	DRM_DEV_INFO(encoder->dev->dev, "MDP3DBG encoder enable");
-	w1a_mb("encoder enable");
 }
 
 static void mdp3_dsi_encoder_disable(struct drm_encoder *encoder)
